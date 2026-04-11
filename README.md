@@ -20,27 +20,39 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
 
 ### 2. Install the Plugin
 
-This repo ships its own local marketplace (`.claude-plugin/marketplace.json`),
-so a clone-and-install is the fastest path:
+Two lines, no clone — Claude Code pulls the marketplace straight from GitHub
+and installs the plugin:
 
 ```bash
-git clone https://github.com/Long-Feeds/claude-feishu-plugin.git
-cd claude-feishu-plugin
-bun install            # one-time: pulls @larksuiteoapi/node-sdk and the MCP SDK
-
-# Register this directory as a marketplace named "feishu-local",
-# then install the "feishu" plugin from it.
-claude plugin marketplace add "$(pwd)"
-claude plugin install feishu@feishu-local
+claude plugin marketplace add Long-Feeds/claude-feishu-plugin
+claude plugin install feishu@claude-feishu
 ```
 
-After install, restart Claude Code so the MCP server is picked up.
+Restart Claude Code so the new MCP server is picked up. The first run will
+auto-install dependencies (`@larksuiteoapi/node-sdk`, MCP SDK) via the
+`bun install` step in `.mcp.json` — give it a few seconds.
 
 > **Requires** [Bun](https://bun.sh/) on `PATH` — `.mcp.json` launches the
 > server with `bun run start`.
 
 To uninstall later: `claude plugin uninstall feishu` and
-`claude plugin marketplace remove feishu-local`.
+`claude plugin marketplace remove claude-feishu`.
+
+<details>
+<summary>Local development install (clone the repo)</summary>
+
+If you're hacking on the plugin itself, point the marketplace at a local
+checkout instead:
+
+```bash
+git clone https://github.com/Long-Feeds/claude-feishu-plugin.git
+cd claude-feishu-plugin
+bun install
+claude plugin marketplace add "$(pwd)"
+claude plugin install feishu@claude-feishu
+```
+
+</details>
 
 ### 3. Configure Credentials
 

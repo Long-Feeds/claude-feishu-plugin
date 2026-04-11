@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "feishu-local",
-  "description": "Local development marketplace for the Feishu (Lark) channel plugin.",
+  "name": "claude-feishu",
+  "description": "Marketplace for the Feishu (Lark) channel plugin for Claude Code.",
   "owner": {
     "name": "lon"
   },
