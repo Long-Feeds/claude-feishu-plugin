@@ -4,6 +4,92 @@ Bridges [Feishu (Lark)](https://www.feishu.cn/) messaging to a Claude Code sessi
 
 No public IP or webhook required — uses Feishu's WebSocket long connection.
 
+## Architecture
+
+```
+                    ┌──────────────────────┐
+                    │   Feishu / Lark App  │
+                    │   (mobile / desktop) │
+                    └──────────┬───────────┘
+                               │ user types message
+                               ▼
+                    ┌──────────────────────┐
+                    │  Feishu Open Platform│
+                    │  msg-frontier (WSS)  │
+                    └──────────┬───────────┘
+                               │ im.message.receive_v1
+                               │ (long-lived WebSocket — no public IP)
+                               ▼
+   ┌─────────────────────────────────────────────────────────┐
+   │  server.ts  (this plugin — single-file MCP server)      │
+   │                                                         │
+   │   ┌─────────────┐    ┌──────────────┐    ┌──────────┐   │
+   │   │  WSClient   │───▶│ access gate  │───▶│  notify  │   │
+   │   │  (lark SDK) │    │ (access.json │    │  (MCP    │   │
+   │   └─────────────┘    │  pairing /   │    │  channel)│   │
+   │                      │  allowlist / │    └────┬─────┘   │
+   │                      │  groups)     │         │         │
+   │                      └──────┬───────┘         │         │
+   │                             │ drop / pair /   │         │
+   │                             │ deliver         │         │
+   │                             ▼                 │         │
+   │                  ┌────────────────────┐       │         │
+   │                  │  pairing reply     │       │         │
+   │                  │  via reply tool    │       │         │
+   │                  └────────────────────┘       │         │
+   │                                               │         │
+   │   tools exposed via MCP stdio  ◀──────────────┘         │
+   │   ┌──────┐ ┌──────┐ ┌────────────┐ ┌─────────────────┐  │
+   │   │reply │ │react │ │edit_message│ │download_attach. │  │
+   │   └──┬───┘ └──┬───┘ └─────┬──────┘ └────────┬────────┘  │
+   └──────┼────────┼───────────┼─────────────────┼───────────┘
+          │        │           │                 │
+          │ Feishu Open API (HTTPS, app-token)   │
+          │   im.message.create / .reply         │
+          │   im.messageReaction.create          │
+          │   im.message.patch                   │
+          │   im.messageResource.get             │
+          │        │           │                 │
+          ▼        ▼           ▼                 ▼
+                    ┌──────────────────────┐
+                    │  Feishu Open Platform│
+                    └──────────┬───────────┘
+                               │ delivered to chat
+                               ▼
+                    ┌──────────────────────┐
+                    │   Feishu / Lark App  │
+                    └──────────────────────┘
+
+   stdio (JSON-RPC)  ▲                ▲ /feishu:configure
+                     │                │ /feishu:access
+                     ▼                │ (terminal-only mutations)
+   ┌─────────────────────────────────────────────────────────┐
+   │              Claude Code (host process)                 │
+   │   spawns server.ts via .mcp.json → bun run start        │
+   └─────────────────────────────────────────────────────────┘
+
+   State on disk:  ~/.claude/channels/feishu/
+                     ├── .env          (FEISHU_APP_ID / FEISHU_APP_SECRET)
+                     ├── access.json   (dmPolicy, allowFrom, groups, pending)
+                     ├── approved/     (pairing handoff to server)
+                     └── inbox/        (downloaded attachments)
+```
+
+**Inbound path** — Feishu pushes events over a WebSocket long connection
+(no webhook, no public IP). The access gate decides per message: drop,
+issue a pairing code, or deliver to Claude Code as an MCP channel notification.
+
+**Outbound path** — Claude Code calls one of four MCP tools (`reply`,
+`react`, `edit_message`, `download_attachment`); the server translates them
+into Feishu Open API HTTPS calls with the app's tenant access token. The
+`reply` tool re-checks the target chat against the gate before sending,
+so a compromised Claude session can't broadcast to arbitrary chats.
+
+**Control plane** — `/feishu:configure` and `/feishu:access` are Claude Code
+skills the user runs from the terminal. They only edit local files
+(`.env`, `access.json`, `approved/`) — they never call Feishu directly,
+and the server is the only thing that talks to Feishu's API.
+
 ## Quick Start
 
 ### 1. Create a Feishu App
