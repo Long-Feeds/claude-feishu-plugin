@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# secrets / local state
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+.claude/channels/
+
+# build / runtime
+*.log
+*.tsbuildinfo
+.DS_Store
