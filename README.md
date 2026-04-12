@@ -114,9 +114,8 @@ claude plugin marketplace add Long-Feeds/claude-feishu-plugin
 claude plugin install feishu@claude-feishu
 ```
 
-Restart Claude Code so the new MCP server is picked up. The first run will
-auto-install dependencies (`@larksuiteoapi/node-sdk`, MCP SDK) via the
-`bun install` step in `.mcp.json` — give it a few seconds.
+The first run will auto-install dependencies (`@larksuiteoapi/node-sdk`,
+MCP SDK) via the `bun install` step in `.mcp.json` — give it a few seconds.
 
 > **Requires** [Bun](https://bun.sh/) on `PATH` — `.mcp.json` launches the
 > server with `bun run start`.
@@ -154,7 +153,23 @@ This saves credentials to `~/.claude/channels/feishu/.env` (chmod 600).
 2. In Claude Code: `/feishu:access pair <code>`
 3. The bot confirms pairing. You're connected!
 
-### 5. Lock Down Access
+### 5. Launch Claude Code with the Channel
+
+Start (or restart) Claude Code, loading the Feishu channel:
+
+```bash
+claude --dangerously-load-development-channels plugin:feishu@claude-feishu
+```
+
+This flag tells Claude Code to activate the channel plugin's MCP server.
+You should see `feishu channel: connected` in the debug output once the
+WebSocket to Feishu is established.
+
+> Once the plugin graduates from development to a published marketplace,
+> this flag will no longer be needed — a normal `claude` invocation will
+> load it automatically.
+
+### 6. Lock Down Access
 
 Once everyone is paired:
 
