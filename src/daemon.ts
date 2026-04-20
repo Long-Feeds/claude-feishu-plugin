@@ -8,7 +8,7 @@ import type { ReplyReq } from "./ipc"
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, type ThreadStore } from "./threads"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 
 export type DaemonConfig = {
@@ -212,25 +212,36 @@ export class Daemon {
     if (thread_id) {
       const rec = findByThreadId(this.threads, thread_id)
       if (!rec) return
-      const entry = this.state.get(rec.session_id)
-      if (!entry) {
-        // Task 11 adds L2 resume here.
+      if (rec.status === "closed") {
+        if (this.cfg.feishuApi) {
+          await this.cfg.feishuApi.sendInThread({
+            root_message_id: rec.root_message_id,
+            text: "thread closed — send a new top-level message for a new session",
+            format: "text", seed_thread: false,
+          }).catch(() => {})
+        }
         return
       }
-      try {
-        entry.conn.write(frame({
-          push: "inbound",
-          content: extractText(event),
-          meta: {
-            chat_id: event.message.chat_id,
-            message_id: event.message.message_id,
-            thread_id,
-            user: event.sender.sender_id?.open_id ?? "",
-            user_id: event.sender.sender_id?.open_id ?? "",
-            ts: new Date(Number(event.message.create_time)).toISOString(),
-          },
-        }))
-      } catch {}
+      const entry = this.state.get(rec.session_id)
+      if (entry) {
+        try {
+          entry.conn.write(frame({
+            push: "inbound",
+            content: extractText(event),
+            meta: {
+              chat_id: event.message.chat_id,
+              message_id: event.message.message_id,
+              thread_id,
+              user: event.sender.sender_id?.open_id ?? "",
+              user_id: event.sender.sender_id?.open_id ?? "",
+              ts: new Date(Number(event.message.create_time)).toISOString(),
+            },
+          }))
+        } catch {}
+        return
+      }
+      // Inactive → L2 resume.
+      await this.resumeSession(rec, thread_id, event)
       return
     }
     await this.spawnYb(event)
@@ -268,6 +279,40 @@ export class Daemon {
       const { spawn } = await import("child_process")
       spawn(cmd.argv[0]!, cmd.argv.slice(1), { stdio: "ignore", detached: true }).unref()
     }
+  }
+
+  private async resumeSession(rec: ThreadRecord, thread_id: string, event: FeishuEvent): Promise<void> {
+    const tmux = this.cfg.tmuxSession ?? "claude-feishu"
+    const { existsSync } = await import("fs")
+    if (!existsSync(rec.cwd)) {
+      if (this.cfg.feishuApi) {
+        await this.cfg.feishuApi.sendInThread({
+          root_message_id: rec.root_message_id,
+          text: `cwd \`${rec.cwd}\` no longer exists; archiving this thread`,
+          format: "text", seed_thread: false,
+        }).catch(() => {})
+      }
+      this.threads.threads[thread_id]!.status = "closed"
+      saveThreads(this.threadsFile, this.threads)
+      return
+    }
+    let prompt = ""
+    try { prompt = JSON.parse(event.message.content).text ?? "" } catch {}
+    const cmd = buildSpawnCommand({
+      session_id: rec.session_id, cwd: rec.cwd, initial_prompt: prompt,
+      tmux_session: tmux, kind: "resume",
+      claude_session_uuid: rec.claude_session_uuid,
+    })
+    if (this.cfg.spawnOverride) {
+      await this.cfg.spawnOverride(cmd.argv, cmd.env)
+    } else {
+      await ensureTmuxSession(tmux)
+      const { spawn } = await import("child_process")
+      spawn(cmd.argv[0]!, cmd.argv.slice(1), { stdio: "ignore", detached: true }).unref()
+    }
+    this.threads.threads[thread_id]!.status = "active"
+    this.threads.threads[thread_id]!.last_active_at = Date.now()
+    saveThreads(this.threadsFile, this.threads)
   }
 
   async stop(): Promise<void> {

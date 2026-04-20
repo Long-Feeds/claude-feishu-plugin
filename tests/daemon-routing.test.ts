@@ -153,3 +153,50 @@ test("top-level DM triggers Y-b spawn via injected spawn_cmd", async () => {
   expect(spawned[0]!.join(" ")).toContain("/home/me/workspace")
   await daemon.stop()
 })
+
+test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const spawned: { argv: string[]; env: Record<string, string> }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Seed threads.json with an inactive thread.
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t1"] = {
+    session_id: "S_OLD", claude_session_uuid: "uuid-xyz",
+    chat_id: "oc_dm", root_message_id: "m0", cwd: "/tmp",    // use /tmp so it exists
+    origin: "Y-b", status: "inactive",
+    last_active_at: 0, last_message_at: 0,
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async (argv, env) => { spawned.push({ argv, env }); return 0 },
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_r1", chat_id: "oc_dm", chat_type: "p2p",
+      thread_id: "t1",
+      message_type: "text", content: '{"text":"continue"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+  expect(spawned.length).toBe(1)
+  expect(spawned[0]!.env.FEISHU_RESUME_UUID).toBe("uuid-xyz")
+  expect(spawned[0]!.env.FEISHU_SESSION_ID).toBe("S_OLD")
+  await daemon.stop()
+})
