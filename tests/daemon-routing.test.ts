@@ -118,3 +118,38 @@ test("X-b first reply creates root msg; subsequent reply creates thread", async 
   s.end()
   await daemon.stop()
 })
+
+test("top-level DM triggers Y-b spawn via injected spawn_cmd", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const spawned: string[][] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async (argv) => { spawned.push(argv); return 0 },
+    defaultCwd: "/home/me/workspace",
+    tmuxSession: "claude-feishu",
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_top", chat_id: "oc_dm", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi claude"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+  expect(spawned.length).toBe(1)
+  expect(spawned[0]!.join(" ")).toContain("new-window")
+  expect(spawned[0]!.join(" ")).toContain("/home/me/workspace")
+  await daemon.stop()
+})

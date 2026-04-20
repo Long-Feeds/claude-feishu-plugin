@@ -9,12 +9,16 @@ import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess } from "./access"
 import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, type ThreadStore } from "./threads"
+import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 
 export type DaemonConfig = {
   stateDir: string
   socketPath: string
   feishuApi: FeishuApi | null
   wsStart: () => Promise<void>
+  tmuxSession?: string
+  defaultCwd?: string
+  spawnOverride?: (argv: string[], env: Record<string, string>) => Promise<number>
 }
 
 export class Daemon {
@@ -25,6 +29,7 @@ export class Daemon {
   private threadsFile: string
   private threads: ThreadStore
   private pendingRoots = new Map<string, { chat_id: string; root_message_id: string }>()
+  private pendingYbRoots = new Map<string, { chat_id: string; root_message_id: string }>()
 
   private constructor(private cfg: DaemonConfig) {
     this.pidFile = join(cfg.stateDir, "daemon.pid")
@@ -114,8 +119,29 @@ export class Daemon {
     const format = msg.format ?? "text"
     const bound = findBySessionId(this.threads, entry.session_id)
     const pending = this.pendingRoots.get(entry.session_id)
+    const ybRoot = this.pendingYbRoots.get(entry.session_id)
 
     try {
+      if (!bound && !pending && ybRoot) {
+        // First reply for Y-b: seed thread rooted on the user's triggering message.
+        const res = await this.cfg.feishuApi.sendInThread({
+          root_message_id: ybRoot.root_message_id, text: msg.text, format, seed_thread: true,
+        })
+        if (!res.thread_id) {
+          conn.write(frame({ id: msg.id, ok: false, error: "Y-b thread creation returned no thread_id" }))
+          return
+        }
+        upsertThread(this.threads, res.thread_id, {
+          session_id: entry.session_id, chat_id: ybRoot.chat_id,
+          root_message_id: ybRoot.root_message_id, cwd: entry.cwd,
+          origin: "Y-b", status: "active",
+          last_active_at: Date.now(), last_message_at: Date.now(),
+        })
+        saveThreads(this.threadsFile, this.threads)
+        this.pendingYbRoots.delete(entry.session_id)
+        conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: res.thread_id }))
+        return
+      }
       if (!bound && !pending) {
         // First reply for X-b: plain create in hub.
         const access = loadAccess(this.accessFile)
@@ -179,7 +205,7 @@ export class Daemon {
     const decision = gate(event, access, botOpenId)
     if (decision.action === "drop") return
     if (decision.action === "pair") {
-      // Task 10 fills in pair-reply; skip here.
+      await this.sendPairReply(event, decision.code, decision.isResend)
       return
     }
     const thread_id = event.message.thread_id
@@ -188,7 +214,7 @@ export class Daemon {
       if (!rec) return
       const entry = this.state.get(rec.session_id)
       if (!entry) {
-        // inactive — Task 11 adds L2 resume.
+        // Task 11 adds L2 resume here.
         return
       }
       try {
@@ -207,7 +233,41 @@ export class Daemon {
       } catch {}
       return
     }
-    // Top-level message (no thread) — Task 10/11 spawn new session.
+    await this.spawnYb(event)
+  }
+
+  private async sendPairReply(event: FeishuEvent, code: string, isResend: boolean): Promise<void> {
+    if (!this.cfg.feishuApi) return
+    const lead = isResend ? "Still pending" : "Pairing required"
+    await this.cfg.feishuApi.sendRoot({
+      chat_id: event.message.chat_id,
+      text: `${lead} — run in Claude Code:\n\n/feishu:access pair ${code}`,
+      format: "text",
+    }).catch((e) => { process.stderr.write(`daemon: pair reply failed: ${e}\n`) })
+  }
+
+  private async spawnYb(event: FeishuEvent): Promise<void> {
+    const tmux = this.cfg.tmuxSession ?? "claude-feishu"
+    const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
+    const session_id = ulid()
+    let prompt = ""
+    try { prompt = JSON.parse(event.message.content).text ?? "" } catch {}
+
+    this.pendingYbRoots.set(session_id, {
+      chat_id: event.message.chat_id,
+      root_message_id: event.message.message_id,
+    })
+
+    if (!this.cfg.spawnOverride) await ensureTmuxSession(tmux)
+    const cmd = buildSpawnCommand({
+      session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "Y-b",
+    })
+    if (this.cfg.spawnOverride) {
+      await this.cfg.spawnOverride(cmd.argv, cmd.env)
+    } else {
+      const { spawn } = await import("child_process")
+      spawn(cmd.argv[0]!, cmd.argv.slice(1), { stdio: "ignore", detached: true }).unref()
+    }
   }
 
   async stop(): Promise<void> {
