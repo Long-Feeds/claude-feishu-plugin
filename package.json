@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@larksuiteoapi/node-sdk": "^1.56.0"
+    "@larksuiteoapi/node-sdk": "^1.56.0",
+    "ulid": "^2.3.0"
   }
 }

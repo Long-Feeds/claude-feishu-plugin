@@ -1,6 +1,7 @@
 import { createServer, Server, Socket } from "net"
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "fs"
 import { join } from "path"
+import { ulid } from "ulid"
 import { DaemonState } from "./daemon-state"
 import { NdjsonParser, frame, type ShimReq, type DaemonMsg } from "./ipc"
 import type { FeishuApi } from "./feishu-api"
@@ -68,10 +69,24 @@ export class Daemon {
     conn.on("error", () => { try { conn.destroy() } catch {} })
   }
 
-  protected onMessage(conn: Socket, _msg: ShimReq): void {
-    // Filled in by later tasks (register, reply, etc.)
-    const resp: DaemonMsg = { id: (_msg as any).id ?? 0, ok: false, error: "not implemented" }
-    try { conn.write(frame(resp)) } catch {}
+  protected onMessage(conn: Socket, msg: ShimReq): void {
+    switch (msg.op) {
+      case "register": return this.handleRegister(conn, msg)
+      default:
+        try {
+          conn.write(frame({ id: (msg as any).id, ok: false, error: `unknown op: ${(msg as any).op}` }))
+        } catch {}
+    }
+  }
+
+  private handleRegister(conn: Socket, msg: Extract<ShimReq, { op: "register" }>): void {
+    const session_id = msg.session_id ?? ulid()
+    this.state.register({
+      session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
+    })
+    try {
+      conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
+    } catch {}
   }
 
   protected onClose(conn: Socket): void {
