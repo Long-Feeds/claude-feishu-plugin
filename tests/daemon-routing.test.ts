@@ -70,3 +70,51 @@ test("register with existing session_id echoes it back", async () => {
   expect(resp.session_id).toBe("01HXYABC")
   await daemon.stop()
 })
+
+import { FeishuApi } from "../src/feishu-api"
+import { saveAccess, defaultAccess } from "../src/access"
+
+test("X-b first reply creates root msg; subsequent reply creates thread", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const calls: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "m1" } } },
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m2", thread_id: "t1" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"; acc.allowFrom = ["ou_abc"]
+  saveAccess(join(dir, "access.json"), acc)
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const replies: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => replies.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+
+  s.write(frame({ id: 1, op: "register", session_id: "S1", pid: 1, cwd: "/w" }))
+  await wait(30)
+  s.write(frame({ id: 2, op: "reply", text: "first", format: "text" }))
+  await wait(30)
+  s.write(frame({ id: 3, op: "reply", text: "second", format: "text" }))
+  await wait(50)
+
+  const createdCalls = calls.filter((c) => c.op === "create")
+  const replyCalls = calls.filter((c) => c.op === "reply")
+  expect(createdCalls.length).toBe(1)
+  expect(replyCalls.length).toBe(1)
+  expect(replyCalls[0].a.data.reply_in_thread).toBe(true)
+
+  s.end()
+  await daemon.stop()
+})
