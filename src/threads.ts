@@ -72,6 +72,7 @@ export function markInactive(store: ThreadStore, session_id: string): void {
 export function markActive(store: ThreadStore, session_id: string): void {
   const found = findBySessionId(store, session_id)
   if (!found) return
+  if (found.status === "closed") return  // terminal; don't resurrect
   store.threads[found.thread_id]!.status = "active"
   store.threads[found.thread_id]!.last_active_at = Date.now()
 }

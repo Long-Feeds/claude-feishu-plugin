@@ -62,3 +62,16 @@ test("close transitions to closed", () => {
   closeThread(store, "t1")
   expect(store.threads["t1"]!.status).toBe("closed")
 })
+
+test("markActive does NOT reopen closed threads", () => {
+  const store = loadThreads(file)
+  upsertThread(store, "t1", {
+    session_id: "S1", chat_id: "c1", root_message_id: "m1",
+    cwd: "/w", origin: "X-b", status: "active",
+    last_active_at: 1, last_message_at: 1,
+  })
+  closeThread(store, "t1")
+  expect(store.threads["t1"]!.status).toBe("closed")
+  markActive(store, "S1")
+  expect(store.threads["t1"]!.status).toBe("closed")   // still closed
+})
