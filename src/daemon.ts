@@ -626,7 +626,27 @@ export class Daemon {
     }
     // Use extractTextAndAttachment so we handle post/text/interactive/etc
     // (the naive JSON.parse(content).text only works for plain text msgs).
-    const { text: prompt } = extractTextAndAttachment(event)
+    const { text: prompt, attachment } = extractTextAndAttachment(event)
+    // Stage the reply as a pendingYbInbound so handleRegister injects it via
+    // tmux send-keys once the respawned shim reconnects — same delivery path
+    // as fresh Y-b spawn. Without this, L2 revival would bring up a Claude
+    // pane with no idea why and silently drop the user's message.
+    this.pendingYbInbound.set(rec.session_id, {
+      content: prompt,
+      meta: {
+        chat_id: event.message.chat_id,
+        message_id: event.message.message_id,
+        thread_id,
+        user: event.sender.sender_id?.open_id ?? "",
+        user_id: event.sender.sender_id?.open_id ?? "",
+        ts: new Date(Number(event.message.create_time)).toISOString(),
+        ...(attachment ? {
+          attachment_kind: attachment.kind,
+          attachment_file_key: attachment.file_key,
+          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        } : {}),
+      },
+    })
     const cmd = buildSpawnCommand({
       session_id: rec.session_id, cwd: rec.cwd, initial_prompt: prompt,
       tmux_session: tmux, kind: "resume",

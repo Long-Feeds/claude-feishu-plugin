@@ -198,5 +198,12 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   expect(spawned.length).toBe(1)
   expect(spawned[0]!.env.FEISHU_RESUME_UUID).toBe("uuid-xyz")
   expect(spawned[0]!.env.FEISHU_SESSION_ID).toBe("S_OLD")
+  // L2 regression guard: the reply text must be staged for injection into
+  // the respawned pane. Without this, revival spawns Claude with no prompt
+  // and the user's message disappears.
+  const pending = (daemon as any).pendingYbInbound.get("S_OLD")
+  expect(pending).toBeDefined()
+  expect(pending.content).toBe("continue")
+  expect(pending.meta.thread_id).toBe("t1")
   await daemon.stop()
 })
