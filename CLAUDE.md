@@ -103,6 +103,10 @@ skills/
 - **shim 重连必须用同一个 session_id 重注册**：daemon 重启后每个 shim 会自动
   指数退避重连，关键是用**原来的** session_id 再次 register，daemon 才能从
   threads.json 恢复 thread 绑定。改 shim 的 keepAlive 循环时小心别丢掉这点。
+- **workspace 的改动不会直接生效**：systemd daemon 跑的是 `~/.claude/plugins/cache/claude-feishu/feishu/0.0.1/`
+  下的拷贝，不是 `~/workspace/claude-feishu-plugin/`。本地改完代码要么重装插件，
+  要么直接 `bun sync`（见 package.json，做 rsync + restart）。忘记同步会让你盯着
+  旧代码的日志排查新代码的 bug。
 
 ## 开发/调试命令
 
