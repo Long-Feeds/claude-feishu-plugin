@@ -106,15 +106,83 @@ Two new tmux windows + two new `threads.json` entries, each with its own
 `session_id` and `thread_id`. Later thread-replies route to the correct
 session regardless of which came first.
 
-### 6. Thread-reply routing (subsequent messages in the same topic)
+### 6. Multi-turn routing in a single thread (lark-cli automatable)
 
-This requires a real user reply in the thread — lark-cli as a different bot
-gets filtered by Feishu (group events only fire on @mention to the bot). From
-a human account, reply in one of the threads. The matching Y-b session sees
-the message as an MCP channel notification (via `push:inbound` → shim →
-`notifications/claude/channel`). Claude auto-processes + replies in-thread.
+Sends N follow-up @mentions into an existing Y-b thread and verifies that
+each is routed to the same session and that Claude replies in sequence.
 
-### 7. L2 revival (not automated; needs human reply)
+Use `lark-cli im +messages-reply --reply-in-thread` to keep the follow-ups
+inside the existing topic (non-@ replies get gated by Feishu and never reach
+the daemon — see §9 "Known rough edges"). The script below drives 3 rounds
+after the initial Y-b spawn:
+
+```bash
+TAG='<at user_id="'"$BOT_OPEN_ID"'">bot</at>'
+
+# Round 1: spawn a fresh Y-b session
+R1=$(lark-cli im +messages-send --chat-id "$TEST_CHAT" \
+  --text "$TAG 多轮测试 R1: 1+1 等于几" --as bot)
+R1_ID=$(echo "$R1" | grep -oE 'om_[a-zA-Z0-9]+' | head -1)
+
+# Give daemon a moment to log the spawn and capture the thread_id it assigned
+sleep 5
+THREAD=$(journalctl --user -u claude-feishu --no-pager --since='30 seconds ago' \
+  | grep 'inbound event' | tail -1 \
+  | grep -oE 'thread=omt_[a-zA-Z0-9]+' | cut -d= -f2)
+
+count_replies() {
+  lark-cli im +threads-messages-list --thread "$THREAD" --as bot 2>/dev/null \
+    | grep -c '"id": "cli_<your-bot-app-id>"'   # sub your bot's app id
+}
+
+# Wait for Round 1 reply to land
+until [ "$(count_replies)" -ge 1 ]; do sleep 3; done
+
+send_round() {
+  local n=$1 q=$2 want=$3
+  lark-cli im +messages-reply --message-id "$R1_ID" \
+    --text "$TAG $q" --reply-in-thread --as bot >/dev/null
+  local start=$(date +%s)
+  until [ "$(count_replies)" -ge "$want" ]; do
+    [ $(($(date +%s) - start)) -gt 90 ] && { echo "R$n TIMEOUT"; return 1; }
+    sleep 3
+  done
+  echo "R$n OK"
+}
+
+send_round 2 "R2: 再问一个，2+2?" 2
+send_round 3 "R3: 3+3?" 3
+send_round 4 "R4: 4+4?" 4
+
+# Final dump — expect interleaved (lark-cli / bot) / (Claude Harness) pairs
+lark-cli im +threads-messages-list --thread "$THREAD" --as bot \
+  | grep -E '"content"|"id": "cli_'
+```
+
+Pass criteria:
+- Each round's `inbound event` → `gate decision: deliver` → `entry FOUND` →
+  **`send-keys inbound to claude-feishu:fb:<prefix>`** appears in
+  `journalctl --user -u claude-feishu`.
+- `threads.json` entry's `last_message_at` advances with each round, but
+  `session_id` and `thread_id` stay fixed.
+- The final thread dump shows alternating lark-cli prompt / Claude reply pairs.
+
+> **Why send-keys, not MCP notification?** For Y-b sessions, subsequent
+> inbound messages are injected via `tmux send-keys` (same path as the
+> initial prompt). Claude Code at an idle `❯` prompt after completing a
+> turn silently drops `notifications/claude/channel` messages sent via MCP,
+> so we route through the tmux pane instead. X-b sessions keep the MCP
+> notification path since they don't have a daemon-owned pane.
+
+### 7. Thread-reply routing from a real human account (not automated)
+
+lark-cli can't trigger non-@ delivery because Feishu filters group events
+to @mentions only for bot receivers. A human account's reply in the thread
+(no @ needed) does arrive at the daemon — verify the same `inbound event →
+entry FOUND → send-keys inbound` log sequence, and that Claude processes +
+replies in-thread.
+
+### 8. L2 revival (not automated; needs human reply)
 
 ```bash
 # Kill a Y-b window manually:
@@ -126,7 +194,7 @@ cat ~/.claude/channels/feishu/threads.json
 # conversation (state-resume deferred until Claude Code exposes session uuid).
 ```
 
-### 8. Daemon restart resilience
+### 9. Daemon restart resilience
 
 ```bash
 systemctl --user restart claude-feishu
@@ -137,7 +205,7 @@ journalctl --user -u claude-feishu -f
 send "restart-check: 回个 ok"
 ```
 
-### 9. Access-control tooling
+### 10. Access-control tooling
 
 ```bash
 /feishu:access threads                            # list all, grouped by status
