@@ -412,8 +412,9 @@ export class Daemon {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
     const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
     const session_id = ulid()
-    let prompt = ""
-    try { prompt = JSON.parse(event.message.content).text ?? "" } catch {}
+    // Use extractTextAndAttachment so we handle post/text/interactive/etc
+    // (the naive JSON.parse(content).text only works for plain text msgs).
+    const { text: prompt } = extractTextAndAttachment(event)
 
     if (preExistingThreadId) {
       // Topic-group trigger: thread already exists (Feishu auto-created it when
@@ -465,8 +466,9 @@ export class Daemon {
       saveThreads(this.threadsFile, this.threads)
       return
     }
-    let prompt = ""
-    try { prompt = JSON.parse(event.message.content).text ?? "" } catch {}
+    // Use extractTextAndAttachment so we handle post/text/interactive/etc
+    // (the naive JSON.parse(content).text only works for plain text msgs).
+    const { text: prompt } = extractTextAndAttachment(event)
     const cmd = buildSpawnCommand({
       session_id: rec.session_id, cwd: rec.cwd, initial_prompt: prompt,
       tmux_session: tmux, kind: "resume",
