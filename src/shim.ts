@@ -18,11 +18,11 @@ import { NdjsonParser, frame } from "./ipc"
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), ".claude", "channels", "feishu")
 const SOCKET_PATH = process.env.FEISHU_DAEMON_SOCKET ?? join(STATE_DIR, "daemon.sock")
 const SESSION_ID = process.env.FEISHU_SESSION_ID ?? null
-const INITIAL_PROMPT_B64 = process.env.FEISHU_INITIAL_PROMPT ?? ""
-
-// Set true after the first registerSession schedules the initial-prompt
-// injection; prevents re-injection on daemon reconnect.
-let initialPromptSent = false
+// FEISHU_INITIAL_PROMPT env is still set by the daemon for historical/debug
+// visibility, but we no longer consume it in the shim — the daemon now pushes
+// the full triggering inbound (with chat_id/thread_id/etc meta) after register,
+// which goes through the normal push:inbound → channel-notification path so
+// Claude auto-processes it exactly like a fresh DM.
 
 let nextId = 1
 let sock: Socket | null = null
@@ -253,22 +253,8 @@ async function registerSession(): Promise<void> {
   if (uuid) {
     request({ op: "session_info", claude_session_uuid: uuid }).catch(() => {})
   }
-  // Inject initial prompt as a channel notification — identical shape to an
-  // inbound DM in the original plugin, so Claude Code auto-processes it as
-  // user input. Delay 3s so MCP handshake (initialize + initialized) has
-  // definitely finished; otherwise Claude drops notifications sent too early.
-  // Guard so reconnects don't re-fire the initial prompt.
-  if (INITIAL_PROMPT_B64 && !initialPromptSent) {
-    initialPromptSent = true
-    const b64 = INITIAL_PROMPT_B64
-    setTimeout(() => {
-      const decoded = Buffer.from(b64, "base64").toString("utf8")
-      mcp.notification({
-        method: "notifications/claude/channel",
-        params: { content: decoded, meta: { session_id: resp.session_id } },
-      }).catch((err) => process.stderr.write(`shim: initial prompt injection failed: ${err}\n`))
-    }, 3000)
-  }
+  // Initial prompt injection now owned by daemon — it pushes a full push:inbound
+  // once register returns, with a 3s delay so MCP handshake completes first.
 }
 
 let reconnecting = false

@@ -114,6 +114,22 @@ export class Daemon {
     try {
       conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
     } catch {}
+    // Fire the queued Y-b / resume triggering message as a normal inbound push
+    // so Claude processes it identically to a DM that just arrived. Delay ~3s
+    // so Claude's MCP handshake (initialize + initialized) completes first —
+    // notifications sent too early get dropped by the client. Only once per
+    // session; reconnect of the same session_id finds no entry and no-ops.
+    const pending = this.pendingYbInbound.get(session_id)
+    if (pending) {
+      this.pendingYbInbound.delete(session_id)
+      setTimeout(() => {
+        try {
+          conn.write(frame({ push: "inbound", content: pending.content, meta: pending.meta }))
+        } catch (err) {
+          process.stderr.write(`daemon: failed to deliver Y-b inbound for ${session_id}: ${err}\n`)
+        }
+      }, 3000)
+    }
   }
 
   private async handleReply(conn: Socket, msg: ReplyReq): Promise<void> {
@@ -408,13 +424,37 @@ export class Daemon {
     }).catch((e) => { process.stderr.write(`daemon: pair reply failed: ${e}\n`) })
   }
 
+  // Pending triggering-event payloads to be pushed to shim once it registers.
+  // Keyed by session_id. Deleted on first firing.
+  private pendingYbInbound = new Map<string, { content: string; meta: Record<string, unknown> }>()
+
   private async spawnYb(event: FeishuEvent, preExistingThreadId?: string): Promise<void> {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
     const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
     const session_id = ulid()
     // Use extractTextAndAttachment so we handle post/text/interactive/etc
     // (the naive JSON.parse(content).text only works for plain text msgs).
-    const { text: prompt } = extractTextAndAttachment(event)
+    const { text: prompt, attachment } = extractTextAndAttachment(event)
+
+    // Stash the triggering event as an inbound push the shim will deliver once
+    // Claude's MCP handshake finishes. Carries the full meta (chat_id, etc.)
+    // that Claude needs to call `reply` correctly.
+    this.pendingYbInbound.set(session_id, {
+      content: prompt,
+      meta: {
+        chat_id: event.message.chat_id,
+        message_id: event.message.message_id,
+        thread_id: event.message.thread_id,
+        user: event.sender.sender_id?.open_id ?? "",
+        user_id: event.sender.sender_id?.open_id ?? "",
+        ts: new Date(Number(event.message.create_time)).toISOString(),
+        ...(attachment ? {
+          attachment_kind: attachment.kind,
+          attachment_file_key: attachment.file_key,
+          ...(attachment.name ? { attachment_name: attachment.name } : {}),
+        } : {}),
+      },
+    })
 
     if (preExistingThreadId) {
       // Topic-group trigger: thread already exists (Feishu auto-created it when
