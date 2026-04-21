@@ -69,11 +69,15 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 3. Extract `senderId` and `chatId` from the pending entry.
 4. Add `senderId` to `allowFrom` (dedupe).
 5. Delete `pending[<code>]`.
-6. Write the updated access.json.
-7. `mkdir -p ~/.claude/channels/feishu/approved` then write
+6. **If `access.hubChatId` is unset (undefined/null), set it to `chatId`.**
+   This is the chat X-b (local terminal) sessions will post their threads into
+   when they call `reply`. First pair wins; rerun `/feishu:configure set-hub <chat_id>`
+   to change later.
+7. Write the updated access.json.
+8. `mkdir -p ~/.claude/channels/feishu/approved` then write
    `~/.claude/channels/feishu/approved/<senderId>` with `chatId` as the
    file contents. The channel server polls this dir and sends "you're in".
-8. Confirm: who was approved (senderId).
+9. Confirm: who was approved (senderId), and whether hubChatId was set this time.
 
 ### `deny <code>`
 
