@@ -42,3 +42,31 @@ test("disabled mode drops", () => {
   const a = defaultAccess(); a.dmPolicy = "disabled"; a.allowFrom = ["ou_abc"]
   expect(gate(evt({ sender: "ou_abc" }), a, "ou_bot").action).toBe("drop")
 })
+
+test("group @mention matches configured botOpenId", () => {
+  const a = defaultAccess()
+  a.groups["oc_g"] = { requireMention: true, allowFrom: [] }
+  const e = evt({ chat_type: "group", chat_id: "oc_g" })
+  e.message.mentions = [{ key: "@_user_1", id: { open_id: "ou_bot" }, name: "bot" }]
+  expect(gate(e, a, "ou_bot").action).toBe("deliver")
+})
+
+test("group @mention does not match when botOpenId unresolved", () => {
+  // Regression guard: empty botOpenId must not silently match every mention.
+  // If Feishu's /bot/v3/info call failed and FEISHU_BOT_OPEN_ID wasn't set,
+  // we'd rather drop than accept arbitrary @s. requireMention group with
+  // no mentionPatterns fallback must drop here.
+  const a = defaultAccess()
+  a.groups["oc_g"] = { requireMention: true, allowFrom: [] }
+  const e = evt({ chat_type: "group", chat_id: "oc_g" })
+  e.message.mentions = [{ key: "@_user_1", id: { open_id: "ou_someone_else" }, name: "x" }]
+  expect(gate(e, a, "").action).toBe("drop")
+})
+
+test("group mentionPatterns fallback delivers even when botOpenId empty", () => {
+  const a = defaultAccess()
+  a.groups["oc_g"] = { requireMention: true, allowFrom: [] }
+  a.mentionPatterns = ["claude"]
+  const e = evt({ chat_type: "group", chat_id: "oc_g", content: '{"text":"hi claude"}' })
+  expect(gate(e, a, "").action).toBe("deliver")
+})

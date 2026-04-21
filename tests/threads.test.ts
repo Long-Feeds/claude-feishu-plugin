@@ -4,7 +4,7 @@ import { join } from "path"
 import { tmpdir } from "os"
 import {
   loadThreads, saveThreads, upsertThread, markInactive, markActive,
-  close as closeThread, findBySessionId, findByThreadId,
+  close as closeThread, findBySessionId, findByThreadId, pruneInactive,
 } from "../src/threads"
 
 let file: string
@@ -61,6 +61,40 @@ test("close transitions to closed", () => {
   })
   closeThread(store, "t1")
   expect(store.threads["t1"]!.status).toBe("closed")
+})
+
+test("pruneInactive drops old inactive but keeps active, closed, and resumable", () => {
+  const store = loadThreads(file)
+  const now = Date.now()
+  const old = now - 60 * 86400_000   // 60 days ago
+  upsertThread(store, "t_old_inactive", {
+    session_id: "S1", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    status: "inactive", last_active_at: old, last_message_at: old,
+  })
+  upsertThread(store, "t_old_closed", {
+    session_id: "S2", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    status: "closed", last_active_at: old, last_message_at: old,
+  })
+  upsertThread(store, "t_active", {
+    session_id: "S3", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    status: "active", last_active_at: old, last_message_at: old,
+  })
+  upsertThread(store, "t_recent_inactive", {
+    session_id: "S4", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    status: "inactive", last_active_at: now - 1000, last_message_at: now - 1000,
+  })
+  // Resumable inactive — L2 would be able to `claude --resume` this, so keep.
+  upsertThread(store, "t_old_resumable", {
+    session_id: "S5", claude_session_uuid: "uuid-keep",
+    chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    status: "inactive", last_active_at: old, last_message_at: old,
+  })
+
+  const pruned = pruneInactive(store, 30 * 86400_000)
+  expect(pruned).toEqual(["t_old_inactive"])
+  expect(Object.keys(store.threads).sort()).toEqual([
+    "t_active", "t_old_closed", "t_old_resumable", "t_recent_inactive",
+  ])
 })
 
 test("markActive does NOT reopen closed threads", () => {

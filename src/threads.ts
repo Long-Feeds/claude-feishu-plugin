@@ -81,3 +81,22 @@ export function close(store: ThreadStore, thread_id: string): void {
   const rec = store.threads[thread_id]
   if (rec) rec.status = "closed"
 }
+
+export function pruneInactive(store: ThreadStore, olderThanMs: number): string[] {
+  // Drops inactive threads older than the cutoff, but keeps:
+  //   - active (live sessions)
+  //   - closed (explicit user archive — don't silently erase intent)
+  //   - inactive-with-claude_session_uuid (resumable — throwing these away
+  //     would permanently lose the ability to L2-revive that conversation)
+  // Returns pruned thread_ids so the caller can log them.
+  const cutoff = Date.now() - olderThanMs
+  const pruned: string[] = []
+  for (const [tid, rec] of Object.entries(store.threads)) {
+    if (rec.status !== "inactive") continue
+    if (rec.claude_session_uuid) continue
+    if (rec.last_active_at > cutoff) continue
+    delete store.threads[tid]
+    pruned.push(tid)
+  }
+  return pruned
+}

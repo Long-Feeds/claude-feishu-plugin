@@ -10,11 +10,42 @@ import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq } fr
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, type ThreadStore, type ThreadRecord } from "./threads"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
+
+export type SendKeysMeta = {
+  chat_id?: string; thread_id?: string; message_id?: string;
+  user?: string; ts?: string;
+}
+
+// Encode a Feishu inbound event as a single-line <channel> tag safe to ship
+// through `tmux send-keys -l`. Two constraints:
+//   1. No literal \n in the typed text — tmux treats it as Enter, which would
+//      submit a partial prompt and leave the tail typed into the next Claude
+//      prompt. Collapse all vertical whitespace to spaces.
+//   2. A malicious sender could embed `</channel>` inside their message to
+//      prematurely close the tag and inject arbitrary content Claude would
+//      process as user input. Escape that sequence defensively (rare in real
+//      text, loud enough to spot if it ever shows up).
+export function wrapForSendKeys(meta: SendKeysMeta, content: string): string {
+  const tags = [
+    `source="feishu"`,
+    meta.chat_id && `chat_id="${meta.chat_id}"`,
+    meta.thread_id && `thread_id="${meta.thread_id}"`,
+    meta.message_id && `message_id="${meta.message_id}"`,
+    meta.user && `user="${meta.user}"`,
+    meta.ts && `ts="${meta.ts}"`,
+  ].filter(Boolean).join(" ")
+  const flattened = content
+    .replace(/<\/channel>/gi, "</ channel>")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return `<channel ${tags}>${flattened}</channel>`
+}
 
 export type DaemonConfig = {
   stateDir: string
@@ -56,6 +87,17 @@ export class Daemon {
         d.threads.threads[tid]!.status = "inactive"
         changed = true
       }
+    }
+    // Drop inactive entries older than TTL (default 30d). Keeps threads.json
+    // bounded — otherwise every auto-spawn adds a row that never goes away.
+    // Active / closed records are preserved: closed is an explicit user intent,
+    // and active is currently in use.
+    const ttlDays = Number(process.env.FEISHU_THREADS_TTL_DAYS ?? "30")
+    const ttlMs = Number.isFinite(ttlDays) && ttlDays > 0 ? ttlDays * 86400_000 : 30 * 86400_000
+    const pruned = pruneInactive(d.threads, ttlMs)
+    if (pruned.length > 0) {
+      process.stderr.write(`daemon: pruned ${pruned.length} inactive thread(s) older than ${ttlDays}d\n`)
+      changed = true
     }
     if (changed) saveThreads(d.threadsFile, d.threads)
     await d.bindSocket()
@@ -146,16 +188,8 @@ export class Daemon {
     const pending = this.pendingYbInbound.get(session_id)
     if (pending) {
       this.pendingYbInbound.delete(session_id)
-      const m = pending.meta as Record<string, string | undefined>
-      const tags = [
-        `source="feishu"`,
-        m.chat_id && `chat_id="${m.chat_id}"`,
-        m.thread_id && `thread_id="${m.thread_id}"`,
-        m.message_id && `message_id="${m.message_id}"`,
-        m.user && `user="${m.user}"`,
-        m.ts && `ts="${m.ts}"`,
-      ].filter(Boolean).join(" ")
-      const wrapped = `<channel ${tags}>${pending.content}</channel>`
+      const m = pending.meta as SendKeysMeta
+      const wrapped = wrapForSendKeys(m, pending.content)
       const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
       const windowName = `fb:${session_id.slice(0, 8)}`
       setTimeout(async () => {
@@ -461,15 +495,7 @@ export class Daemon {
           // auto-process channel notifications — we saw it consistently drop
           // round-2+ inbound during multi-turn testing. send-keys simulates
           // user input, which reliably kicks Claude's input loop.
-          const tags = [
-            `source="feishu"`,
-            inboundMeta.chat_id && `chat_id="${inboundMeta.chat_id}"`,
-            inboundMeta.thread_id && `thread_id="${inboundMeta.thread_id}"`,
-            inboundMeta.message_id && `message_id="${inboundMeta.message_id}"`,
-            inboundMeta.user && `user="${inboundMeta.user}"`,
-            inboundMeta.ts && `ts="${inboundMeta.ts}"`,
-          ].filter(Boolean).join(" ")
-          const wrapped = `<channel ${tags}>${text}</channel>`
+          const wrapped = wrapForSendKeys(inboundMeta as SendKeysMeta, text)
           const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
           const windowName = `fb:${rec.session_id.slice(0, 8)}`
           const target = `${tmuxSession}:${windowName}`
@@ -631,6 +657,31 @@ if (import.meta.main) {
   })
 }
 
+async function resolveBotOpenId(appId: string, appSecret: string): Promise<string> {
+  // Env override wins — users whose app_secret doesn't have contact:user.* scope
+  // can paste their bot open_id (visible in any inbound mentions[].id.open_id or
+  // in Feishu developer console) into .env and move on.
+  const override = process.env.FEISHU_BOT_OPEN_ID?.trim()
+  if (override) return override
+  try {
+    // /bot/v3/info only needs tenant_access_token (no extra scopes), unlike
+    // /contact/v3/users/:id which requires contact:user.* scopes most bots lack.
+    const tok = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+    }).then((r) => r.json() as Promise<{ code: number; tenant_access_token?: string }>)
+    if (tok.code !== 0 || !tok.tenant_access_token) return ""
+    const info = await fetch("https://open.feishu.cn/open-apis/bot/v3/info", {
+      headers: { Authorization: `Bearer ${tok.tenant_access_token}` },
+    }).then((r) => r.json() as Promise<{ code: number; bot?: { open_id?: string } }>)
+    if (info.code !== 0) return ""
+    return info.bot?.open_id ?? ""
+  } catch {
+    return ""
+  }
+}
+
 async function main(): Promise<void> {
   const { homedir } = await import("os")
   const { readFileSync, chmodSync } = await import("fs")
@@ -652,14 +703,12 @@ async function main(): Promise<void> {
   const { FeishuApi } = await import("./feishu-api")
   const api = new FeishuApi(client as any)
 
-  let botOpenId = ""
-  try {
-    const r: any = await (client as any).contact.user.get({
-      path: { user_id: APP_ID! }, params: { user_id_type: "app_id" },
-    })
-    botOpenId = r?.data?.user?.open_id ?? ""
-  } catch {
-    process.stderr.write("daemon: could not resolve bot open_id at startup\n")
+  let botOpenId = await resolveBotOpenId(APP_ID!, APP_SECRET!)
+  if (botOpenId) {
+    process.stderr.write(`daemon: bot open_id=${botOpenId}\n`)
+  } else {
+    process.stderr.write("daemon: could not resolve bot open_id at startup — @mention gating will fail for groups with requireMention=true\n")
+    process.stderr.write("daemon: set FEISHU_BOT_OPEN_ID in ~/.claude/channels/feishu/.env (find it in Feishu dev console or via any inbound event's mentions[].id.open_id)\n")
   }
 
   let deliveredDaemon: Daemon | null = null
