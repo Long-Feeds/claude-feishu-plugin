@@ -9,7 +9,7 @@ import type { ReplyReq } from "./ipc"
 import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq } from "./ipc"
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
-import { loadAccess } from "./access"
+import { loadAccess, saveAccess } from "./access"
 import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
@@ -301,6 +301,8 @@ export class Daemon {
     const decision = gate(event, access, botOpenId)
     if (decision.action === "drop") return
     if (decision.action === "pair") {
+      // gate() mutated access.pending (issued or bumped replies) — persist it
+      saveAccess(this.accessFile, access)
       await this.sendPairReply(event, decision.code, decision.isResend)
       return
     }
