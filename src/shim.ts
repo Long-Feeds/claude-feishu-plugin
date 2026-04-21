@@ -20,6 +20,10 @@ const SOCKET_PATH = process.env.FEISHU_DAEMON_SOCKET ?? join(STATE_DIR, "daemon.
 const SESSION_ID = process.env.FEISHU_SESSION_ID ?? null
 const INITIAL_PROMPT_B64 = process.env.FEISHU_INITIAL_PROMPT ?? ""
 
+// Set true after the first registerSession schedules the initial-prompt
+// injection; prevents re-injection on daemon reconnect.
+let initialPromptSent = false
+
 let nextId = 1
 let sock: Socket | null = null
 const parser = new NdjsonParser()
@@ -249,12 +253,21 @@ async function registerSession(): Promise<void> {
   if (uuid) {
     request({ op: "session_info", claude_session_uuid: uuid }).catch(() => {})
   }
-  if (INITIAL_PROMPT_B64) {
-    const decoded = Buffer.from(INITIAL_PROMPT_B64, "base64").toString("utf8")
-    mcp.notification({
-      method: "notifications/claude/channel",
-      params: { content: decoded, meta: { initial: true, session_id: resp.session_id } },
-    }).catch(() => {})
+  // Inject initial prompt as a channel notification — identical shape to an
+  // inbound DM in the original plugin, so Claude Code auto-processes it as
+  // user input. Delay 3s so MCP handshake (initialize + initialized) has
+  // definitely finished; otherwise Claude drops notifications sent too early.
+  // Guard so reconnects don't re-fire the initial prompt.
+  if (INITIAL_PROMPT_B64 && !initialPromptSent) {
+    initialPromptSent = true
+    const b64 = INITIAL_PROMPT_B64
+    setTimeout(() => {
+      const decoded = Buffer.from(b64, "base64").toString("utf8")
+      mcp.notification({
+        method: "notifications/claude/channel",
+        params: { content: decoded, meta: { session_id: resp.session_id } },
+      }).catch((err) => process.stderr.write(`shim: initial prompt injection failed: ${err}\n`))
+    }, 3000)
   }
 }
 
