@@ -299,6 +299,7 @@ export class Daemon {
   async deliverFeishuEvent(event: FeishuEvent, botOpenId: string): Promise<void> {
     const access = loadAccess(this.accessFile)
     const decision = gate(event, access, botOpenId)
+    process.stderr.write(`daemon: gate decision: ${decision.action}\n`)
     if (decision.action === "drop") return
     if (decision.action === "pair") {
       // gate() mutated access.pending (issued or bumped replies) — persist it
@@ -309,7 +310,13 @@ export class Daemon {
     const thread_id = event.message.thread_id
     if (thread_id) {
       const rec = findByThreadId(this.threads, thread_id)
-      if (!rec) return
+      if (!rec) {
+        // Unknown thread. In topic-mode groups, the *root* message of a new
+        // topic already carries a thread_id (Feishu auto-threads). Treat as a
+        // fresh Y-b trigger and bind this thread_id to the new session up-front.
+        await this.spawnYb(event, thread_id)
+        return
+      }
       if (rec.status === "closed") {
         if (this.cfg.feishuApi) {
           await this.cfg.feishuApi.sendInThread({
@@ -401,27 +408,45 @@ export class Daemon {
     }).catch((e) => { process.stderr.write(`daemon: pair reply failed: ${e}\n`) })
   }
 
-  private async spawnYb(event: FeishuEvent): Promise<void> {
+  private async spawnYb(event: FeishuEvent, preExistingThreadId?: string): Promise<void> {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
     const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
     const session_id = ulid()
     let prompt = ""
     try { prompt = JSON.parse(event.message.content).text ?? "" } catch {}
 
-    this.pendingYbRoots.set(session_id, {
-      chat_id: event.message.chat_id,
-      root_message_id: event.message.message_id,
-    })
+    if (preExistingThreadId) {
+      // Topic-group trigger: thread already exists (Feishu auto-created it when
+      // the root message was posted). Bind the session to it immediately so the
+      // first reply uses seed_thread:false on the existing thread.
+      upsertThread(this.threads, preExistingThreadId, {
+        session_id, chat_id: event.message.chat_id,
+        root_message_id: event.message.message_id, cwd,
+        origin: "Y-b", status: "active",
+        last_active_at: Date.now(), last_message_at: Date.now(),
+      })
+      saveThreads(this.threadsFile, this.threads)
+    } else {
+      this.pendingYbRoots.set(session_id, {
+        chat_id: event.message.chat_id,
+        root_message_id: event.message.message_id,
+      })
+    }
 
     if (!this.cfg.spawnOverride) await ensureTmuxSession(tmux)
     const cmd = buildSpawnCommand({
       session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "Y-b",
     })
+    process.stderr.write(`daemon: spawnYb session=${session_id} cwd=${cwd} argv=${JSON.stringify(cmd.argv)}\n`)
     if (this.cfg.spawnOverride) {
       await this.cfg.spawnOverride(cmd.argv, cmd.env)
     } else {
       const { spawn } = await import("child_process")
-      spawn(cmd.argv[0]!, cmd.argv.slice(1), { stdio: "ignore", detached: true }).unref()
+      const child = spawn(cmd.argv[0]!, cmd.argv.slice(1), { stdio: ["ignore", "pipe", "pipe"], detached: true })
+      child.stdout?.on("data", (b) => process.stderr.write(`spawn stdout: ${b}`))
+      child.stderr?.on("data", (b) => process.stderr.write(`spawn stderr: ${b}`))
+      child.on("exit", (code) => process.stderr.write(`daemon: spawn exit code=${code}\n`))
+      child.unref()
     }
   }
 
@@ -504,14 +529,20 @@ async function main(): Promise<void> {
   }
 
   let deliveredDaemon: Daemon | null = null
+  // Keep ws + dispatcher at main() scope so they stay referenced for the
+  // life of the process (nested fn scope drops them after await returns,
+  // which in some bun/Node builds lets GC collect the dispatcher closure).
+  let ws: lark.WSClient | null = null
+  let dispatcher: lark.EventDispatcher | null = null
   const daemon = await Daemon.start({
     stateDir: STATE_DIR,
     socketPath: join(STATE_DIR, "daemon.sock"),
     feishuApi: api,
     wsStart: async () => {
-      const dispatcher = new lark.EventDispatcher({})
+      dispatcher = new lark.EventDispatcher({})
       dispatcher.register({
         "im.message.receive_v1": async (data: any) => {
+          process.stderr.write(`daemon: inbound event from ${data?.sender?.sender_id?.open_id ?? "?"} chat=${data?.message?.chat_id ?? "?"} type=${data?.message?.chat_type ?? "?"} thread=${data?.message?.thread_id ?? "-"}\n`)
           const d = deliveredDaemon
           if (!d) return
           await d.deliverFeishuEvent(data as FeishuEvent, botOpenId).catch((err) => {
@@ -519,15 +550,18 @@ async function main(): Promise<void> {
           })
         },
       })
-      const ws = new lark.WSClient({
+      ws = new lark.WSClient({
         appId: APP_ID!, appSecret: APP_SECRET!, domain: lark.Domain.Feishu,
-        loggerLevel: lark.LoggerLevel.info,
+        loggerLevel: lark.LoggerLevel.debug,
       })
       await ws.start({ eventDispatcher: dispatcher })
       process.stderr.write("daemon: WebSocket connected\n")
     },
   })
   deliveredDaemon = daemon
+  // Belt-and-suspenders keepalive so the event loop has at least one timer
+  // and the closures above don't look "finishable" to the GC.
+  setInterval(() => { void ws; void dispatcher }, 60000).unref()
 
   const shutdown = (): void => {
     void daemon.stop().then(() => process.exit(0))
