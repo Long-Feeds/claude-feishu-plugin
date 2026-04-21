@@ -374,6 +374,7 @@ export class Daemon {
         return
       }
       const entry = this.state.get(rec.session_id)
+      process.stderr.write(`daemon: thread ${thread_id} → session ${rec.session_id} → entry ${entry ? "FOUND" : "MISSING"}\n`)
       if (entry) {
         const { text, attachment } = extractTextAndAttachment(event)
 
@@ -415,26 +416,63 @@ export class Daemon {
             }
           } catch {}
         }
+        const inboundMeta: Record<string, string> = {
+          chat_id: event.message.chat_id,
+          message_id: event.message.message_id,
+          thread_id,
+          user: event.sender.sender_id?.open_id ?? "",
+          user_id: event.sender.sender_id?.open_id ?? "",
+          ts: new Date(Number(event.message.create_time)).toISOString(),
+        }
+        if (imagePath) inboundMeta.image_path = imagePath
+        if (attachment) {
+          inboundMeta.attachment_kind = attachment.kind
+          inboundMeta.attachment_file_key = attachment.file_key
+          if (attachment.name) inboundMeta.attachment_name = attachment.name
+        }
+
+        if (rec.origin === "Y-b") {
+          // Y-b: inject via tmux send-keys instead of MCP channel notification.
+          // Claude Code at the idle `❯` prompt after a completed task doesn't
+          // auto-process channel notifications — we saw it consistently drop
+          // round-2+ inbound during multi-turn testing. send-keys simulates
+          // user input, which reliably kicks Claude's input loop.
+          const tags = [
+            `source="feishu"`,
+            inboundMeta.chat_id && `chat_id="${inboundMeta.chat_id}"`,
+            inboundMeta.thread_id && `thread_id="${inboundMeta.thread_id}"`,
+            inboundMeta.message_id && `message_id="${inboundMeta.message_id}"`,
+            inboundMeta.user && `user="${inboundMeta.user}"`,
+            inboundMeta.ts && `ts="${inboundMeta.ts}"`,
+          ].filter(Boolean).join(" ")
+          const wrapped = `<channel ${tags}>${text}</channel>`
+          const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
+          const windowName = `fb:${rec.session_id.slice(0, 8)}`
+          const target = `${tmuxSession}:${windowName}`
+          try {
+            const { spawn } = await import("child_process")
+            spawn("tmux", ["send-keys", "-t", target, "-l", wrapped], { stdio: "ignore" }).unref()
+            setTimeout(() => {
+              spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" }).unref()
+            }, 300)
+            process.stderr.write(`daemon: send-keys inbound to ${target} (thread ${thread_id})\n`)
+          } catch (err) {
+            process.stderr.write(`daemon: send-keys inbound FAILED for ${target}: ${err}\n`)
+          }
+          return
+        }
+
+        // X-b: push via MCP channel notification (shim forwards to Claude).
         try {
           entry.conn.write(frame({
             push: "inbound",
             content: text,
-            meta: {
-              chat_id: event.message.chat_id,
-              message_id: event.message.message_id,
-              thread_id,
-              user: event.sender.sender_id?.open_id ?? "",
-              user_id: event.sender.sender_id?.open_id ?? "",
-              ts: new Date(Number(event.message.create_time)).toISOString(),
-              ...(imagePath ? { image_path: imagePath } : {}),
-              ...(attachment ? {
-                attachment_kind: attachment.kind,
-                attachment_file_key: attachment.file_key,
-                ...(attachment.name ? { attachment_name: attachment.name } : {}),
-              } : {}),
-            },
+            meta: inboundMeta,
           }))
-        } catch {}
+          process.stderr.write(`daemon: pushed inbound to session ${rec.session_id} (thread ${thread_id})\n`)
+        } catch (err) {
+          process.stderr.write(`daemon: push inbound FAILED for ${rec.session_id}: ${err}\n`)
+        }
         return
       }
       // Inactive → L2 resume.
