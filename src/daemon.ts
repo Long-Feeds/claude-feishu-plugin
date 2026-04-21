@@ -19,25 +19,38 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 export type SendKeysMeta = {
   chat_id?: string; thread_id?: string; message_id?: string;
   user?: string; ts?: string;
+  // Attachment passthroughs — the shim's MCP instructions tell Claude to Read
+  // image_path when present and to call download_attachment on file_key.
+  // Dropping these tags here silently breaks image/file inbound on Y-b paths.
+  image_path?: string;
+  attachment_kind?: string;
+  attachment_file_key?: string;
+  attachment_name?: string;
 }
 
 // Encode a Feishu inbound event as a single-line <channel> tag safe to ship
-// through `tmux send-keys -l`. Two constraints:
+// through `tmux send-keys -l`. Three constraints:
 //   1. No literal \n in the typed text — tmux treats it as Enter, which would
 //      submit a partial prompt and leave the tail typed into the next Claude
 //      prompt. Collapse all vertical whitespace to spaces.
 //   2. A malicious sender could embed `</channel>` inside their message to
 //      prematurely close the tag and inject arbitrary content Claude would
-//      process as user input. Escape that sequence defensively (rare in real
-//      text, loud enough to spot if it ever shows up).
+//      process as user input. Escape that sequence defensively.
+//   3. Attribute values may contain `"` (e.g. an attachment_name with quotes
+//      in it). Escape them so they don't break the tag.
+function attr(v: string): string { return v.replace(/"/g, "&quot;") }
 export function wrapForSendKeys(meta: SendKeysMeta, content: string): string {
   const tags = [
     `source="feishu"`,
-    meta.chat_id && `chat_id="${meta.chat_id}"`,
-    meta.thread_id && `thread_id="${meta.thread_id}"`,
-    meta.message_id && `message_id="${meta.message_id}"`,
-    meta.user && `user="${meta.user}"`,
-    meta.ts && `ts="${meta.ts}"`,
+    meta.chat_id && `chat_id="${attr(meta.chat_id)}"`,
+    meta.thread_id && `thread_id="${attr(meta.thread_id)}"`,
+    meta.message_id && `message_id="${attr(meta.message_id)}"`,
+    meta.user && `user="${attr(meta.user)}"`,
+    meta.ts && `ts="${attr(meta.ts)}"`,
+    meta.image_path && `image_path="${attr(meta.image_path)}"`,
+    meta.attachment_kind && `attachment_kind="${attr(meta.attachment_kind)}"`,
+    meta.attachment_file_key && `attachment_file_key="${attr(meta.attachment_file_key)}"`,
+    meta.attachment_name && `attachment_name="${attr(meta.attachment_name)}"`,
   ].filter(Boolean).join(" ")
   const flattened = content
     .replace(/<\/channel>/gi, "</ channel>")
@@ -455,7 +468,10 @@ export class Daemon {
           return
         }
 
-        // Download images eagerly.
+        // Download images eagerly so the send-keys payload can include an
+        // image_path attribute Claude can Read immediately. If this fails,
+        // keep going — attachment_file_key is still in the tag and Claude can
+        // fall back to the download_attachment MCP tool.
         let imagePath: string | undefined
         if (event.message.message_type === "image" && this.cfg.feishuApi) {
           try {
@@ -472,7 +488,9 @@ export class Daemon {
               })
               imagePath = dest
             }
-          } catch {}
+          } catch (err) {
+            process.stderr.write(`daemon: eager image download failed (Claude can still call download_attachment): ${err}\n`)
+          }
         }
         const inboundMeta: Record<string, string> = {
           chat_id: event.message.chat_id,

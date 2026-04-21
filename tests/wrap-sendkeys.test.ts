@@ -41,3 +41,26 @@ test("handles empty content gracefully", () => {
   const out = wrapForSendKeys(meta, "")
   expect(out.endsWith("></channel>")).toBe(true)
 })
+
+test("emits image_path and attachment_* so Claude can see attachments", () => {
+  // Previously these tags were dropped — Claude got the prompt but no
+  // indication an image was attached, so "describe this image" requests
+  // fell through to "I don't see any image" replies.
+  const out = wrapForSendKeys({
+    ...meta,
+    image_path: "/home/me/.claude/channels/feishu/inbox/1745-key.png",
+    attachment_kind: "image", attachment_file_key: "img_k_abc",
+  }, "describe this")
+  expect(out).toContain('image_path="/home/me/.claude/channels/feishu/inbox/1745-key.png"')
+  expect(out).toContain('attachment_kind="image"')
+  expect(out).toContain('attachment_file_key="img_k_abc"')
+})
+
+test("escapes quotes in attribute values", () => {
+  // A file named 'report "Q1".pdf' would otherwise split the tag.
+  const out = wrapForSendKeys({ ...meta, attachment_name: 'report "Q1".pdf' }, "see attached")
+  expect(out).toContain('attachment_name="report &quot;Q1&quot;.pdf"')
+  // Sanity: still parseable as a single tag pair.
+  expect(out.match(/<channel\s/g)?.length).toBe(1)
+  expect(out.match(/<\/channel>/g)?.length).toBe(1)
+})
