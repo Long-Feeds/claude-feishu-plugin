@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code Feishu channel daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash -c 'cd ${PLUGIN_ROOT} && bun src/daemon.ts'
+Restart=on-failure
+RestartSec=5
+Environment=FEISHU_STATE_DIR=${HOME}/.claude/channels/feishu
+# Ensure bun is on PATH for systemd's minimal env:
+Environment=PATH=${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
