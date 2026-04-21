@@ -10,7 +10,7 @@ import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq } fr
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, type ThreadStore, type ThreadRecord } from "./threads"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
 
@@ -47,6 +47,17 @@ export class Daemon {
   static async start(cfg: DaemonConfig): Promise<Daemon> {
     const d = new Daemon(cfg)
     d.claimPidFile()
+    // At boot, nothing is connected yet — any "active" in threads.json is a
+    // lingering value from the previous daemon lifetime. Sweep to inactive;
+    // shims that reconnect will flip themselves back via handleRegister.
+    let changed = false
+    for (const [tid, rec] of Object.entries(d.threads.threads)) {
+      if (rec.status === "active") {
+        d.threads.threads[tid]!.status = "inactive"
+        changed = true
+      }
+    }
+    if (changed) saveThreads(d.threadsFile, d.threads)
     await d.bindSocket()
     await cfg.wsStart()
     return d
@@ -111,6 +122,12 @@ export class Daemon {
     this.state.register({
       session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
     })
+    // If the session already has a thread binding, flip status back to active
+    // (e.g. shim reconnecting after daemon restart).
+    if (findBySessionId(this.threads, session_id)) {
+      markActive(this.threads, session_id)
+      saveThreads(this.threadsFile, this.threads)
+    }
     try {
       conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
     } catch {}
@@ -340,6 +357,13 @@ export class Daemon {
     const entry = this.state.findByConn(conn)
     if (!entry) return
     this.state.remove(entry.session_id)
+    // Reflect shim disconnect in persistent state so `/feishu:access threads`
+    // and friends show realistic status. The thread stays — L2 revival brings
+    // it back up if the user replies into it later.
+    if (findBySessionId(this.threads, entry.session_id)) {
+      markInactive(this.threads, entry.session_id)
+      saveThreads(this.threadsFile, this.threads)
+    }
   }
 
   async deliverFeishuEvent(event: FeishuEvent, botOpenId: string): Promise<void> {
