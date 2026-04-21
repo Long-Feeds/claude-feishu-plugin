@@ -61,13 +61,32 @@ function onMessage(msg: any): void {
   }
 }
 
+const MAX_BUFFER = 64
+const buffered: { id: number; body: object; resolve: (m: any) => void; reject: (e: Error) => void }[] = []
+
 async function request(op: object): Promise<any> {
-  await ensureConnected()
   const id = nextId++
+  const body = { id, ...op }
   return new Promise<any>((resolve, reject) => {
     pending.set(id, (m) => m.ok ? resolve(m) : reject(new Error(m.error ?? "daemon error")))
-    sock!.write(frame({ id, ...op }))
+    if (sock && !sock.destroyed) {
+      sock.write(frame(body))
+    } else {
+      if (buffered.length >= MAX_BUFFER) {
+        reject(new Error("daemon temporarily unavailable, retry"))
+        pending.delete(id)
+        return
+      }
+      buffered.push({ id, body, resolve, reject })
+    }
   })
+}
+
+function flushBuffer(): void {
+  while (buffered.length > 0 && sock && !sock.destroyed) {
+    const m = buffered.shift()!
+    try { sock.write(frame(m.body)) } catch { break }
+  }
 }
 
 const mcp = new Server(
@@ -215,6 +234,7 @@ async function registerSession(): Promise<void> {
   const resp = await request({
     op: "register", session_id: SESSION_ID, pid: process.pid, cwd: process.cwd(),
   })
+  flushBuffer()
   if (INITIAL_PROMPT_B64) {
     const decoded = Buffer.from(INITIAL_PROMPT_B64, "base64").toString("utf8")
     mcp.notification({
@@ -224,5 +244,26 @@ async function registerSession(): Promise<void> {
   }
 }
 
+let reconnecting = false
+
+async function keepAlive(): Promise<void> {
+  while (true) {
+    await new Promise<void>((r) => {
+      if (!sock || sock.destroyed) return r()
+      sock.once("close", () => r())
+    })
+    if (reconnecting) continue
+    reconnecting = true
+    try {
+      await registerSession()
+    } catch {
+      await new Promise((r) => setTimeout(r, 1000))
+    } finally {
+      reconnecting = false
+    }
+  }
+}
+
 await mcp.connect(new StdioServerTransport())
 await registerSession().catch((err) => process.stderr.write(`shim: register failed: ${err}\n`))
+void keepAlive()

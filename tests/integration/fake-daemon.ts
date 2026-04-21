@@ -28,6 +28,7 @@ export class FakeDaemon {
   }
 
   async stop(): Promise<void> {
+    if (this.conn && !this.conn.destroyed) this.conn.destroy()
     await new Promise<void>((r) => this.server.close(() => r()))
   }
 }
