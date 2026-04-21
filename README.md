@@ -167,6 +167,84 @@ Once everyone is paired:
 /feishu:access policy allowlist
 ```
 
+## Usage
+
+Once the daemon is running (Step 5) and you're paired (Step 4), three flows
+are available. Each Feishu thread corresponds to one Claude Code session.
+
+### Flow 1 — DM the bot to spawn a new session (Y-b)
+
+You're on mobile, want Claude to poke at something in `~/workspace`:
+
+1. DM your bot: `帮我看看 ~/workspace/foo 里 flaky test 的栈怎么回事`
+2. The daemon spawns a new Claude session as a tmux window (session
+   `claude-feishu`). Initial cwd is `~/workspace` (override with env
+   `FEISHU_DEFAULT_CWD` on the daemon).
+3. Claude reads your message, starts working, and replies — that reply
+   creates a **thread** rooted on your DM message. All subsequent progress
+   updates land in the same thread.
+4. Reply in the thread to give Claude more context.
+5. Peek at the live session any time: `tmux attach -t claude-feishu` (each
+   Y-b spawn is its own window).
+
+### Flow 2 — Local terminal session pushes updates to Feishu (X-b)
+
+You're working in a terminal with `claude`, want Feishu pings on a long-running task:
+
+1. Open a terminal: `cd ~/workspace/somerepo && claude`.
+2. The plugin's shim auto-attaches to the daemon (no flag needed after
+   Step 5).
+3. When Claude calls the `reply` tool — e.g., you asked "飞书通知我一下
+   测试跑完", Claude decides to reply once it's done — the message goes to
+   your **hub chat** (the DM you first paired with).
+4. The first `reply` creates a root message; the second `reply` seeds a
+   thread on top of that root. All further replies from this session stay
+   in that thread.
+5. You can answer in the thread to steer Claude remotely.
+
+### Flow 3 — Revive a dead session by replying in an old thread (L2)
+
+Terminal closed, laptop slept, or you ran `tmux kill-window` — the session
+is gone but the thread in Feishu still exists (status=inactive).
+
+1. Reply anything in that thread.
+2. Daemon sees the inbound on an inactive thread → spawns a fresh `claude`
+   in the original cwd and delivers your reply as its new prompt.
+3. Thread goes back to `active`.
+
+> ⚠️ **L2 today is conversation revival, not state resume.** Claude Code
+> 2.1 doesn't expose its session UUID to MCP children, so the daemon can't
+> call `claude --resume <uuid>`. The revived session gets a clean Claude
+> context and your reply as the new task. It's the same cwd so files and
+> git state carry over, but Claude's prior reasoning does not. If Claude
+> Code later exposes the session UUID via env, the shim is already wired
+> to report it (see `src/shim.ts`) and L2 flips automatically to real
+> state resume.
+
+### Managing sessions and threads
+
+| Command | Effect |
+|---|---|
+| `/feishu:access threads` | List all threads grouped by status (active / inactive / closed) |
+| `/feishu:access thread close <thread_id>` | Archive a thread — replies to it get "thread closed" auto-response |
+| `/feishu:access thread kill <thread_id>` | `tmux kill-window` on the session's window; daemon auto-flips status to inactive |
+| `/feishu:configure set-hub <chat_id>` | Change the hub chat for X-b sessions (first pair auto-sets this) |
+| `/feishu:configure install-service` | (Re)install the systemd user service |
+| `/feishu:configure uninstall-service` | Disable + remove the systemd service |
+| `systemctl --user status claude-feishu` | Check daemon liveness |
+| `journalctl --user -u claude-feishu -f` | Live daemon logs |
+| `tmux attach -t claude-feishu` | Watch all spawned Y-b/L2 sessions |
+
+### Permission requests
+
+When Claude Code needs approval for a tool call (e.g., a destructive shell
+command), the daemon posts the request in the thread for that session.
+Reply in the thread with `y <code>` to allow or `n <code>` to deny — a
+thumbs-up / thumbs-down reaction on your reply confirms the bot got it.
+
+If the session hasn't created a thread yet (first-ever reply hasn't run),
+the request goes to your hub chat instead.
+
 ## Tools
 
 The plugin exposes four MCP tools to Claude Code:
