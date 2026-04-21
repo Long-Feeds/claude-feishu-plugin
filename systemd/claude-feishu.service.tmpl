@@ -7,6 +7,11 @@ Type=simple
 ExecStart=/usr/bin/env bash -c 'cd ${PLUGIN_ROOT} && bun src/daemon.ts'
 Restart=on-failure
 RestartSec=5
+# Only SIGTERM the daemon process on stop/restart. Default KillMode=control-group
+# SIGTERMs the entire CGroup — which includes the tmux server the daemon spawned
+# via ensureTmuxSession and every Y-b claude process underneath it. That kills
+# active sessions on every daemon restart and defeats shim reconnect.
+KillMode=process
 Environment=FEISHU_STATE_DIR=${HOME}/.claude/channels/feishu
 # Ensure bun and claude are on PATH (systemd user env is minimal):
 Environment=PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin

@@ -32,28 +32,49 @@ const pushHandlers = new Map<string, (msg: any) => void>()
 
 async function ensureConnected(): Promise<void> {
   if (sock && !sock.destroyed) return
+  // Retry forever with exponential backoff capped at 5s. The daemon may be
+  // restarting (systemd Restart=on-failure) or its WS handshake with Feishu
+  // may still be in progress. A bounded retry would give up and exit the
+  // MCP child, which Claude Code doesn't auto-restart — better to keep the
+  // shim alive and reconnect whenever the socket comes back.
   let delay = 100
-  for (let i = 0; i < 5; i++) {
+  while (true) {
     try { await connectOnce(); return } catch {
       await new Promise((r) => setTimeout(r, delay))
-      delay = Math.min(delay * 2, 30000)
+      delay = Math.min(delay * 2, 5000)
     }
   }
-  throw new Error("feishu daemon not running — try `systemctl --user start claude-feishu`")
 }
 
 function connectOnce(): Promise<void> {
   return new Promise((resolve, reject) => {
     const s = connect(SOCKET_PATH)
-    s.once("connect", () => { sock = s; attachHandlers(s); resolve() })
-    s.once("error", reject)
+    let settled = false
+    const onErr = (err: unknown) => {
+      if (settled) return
+      settled = true
+      try { s.destroy() } catch {}
+      reject(err)
+    }
+    const onOk = () => {
+      if (settled) return
+      settled = true
+      s.removeListener("error", onErr)
+      sock = s
+      attachHandlers(s)
+      resolve()
+    }
+    s.once("error", onErr)
+    s.once("connect", onOk)
   })
 }
 
 function attachHandlers(s: Socket): void {
   s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => onMessage(m as any)))
-  s.on("close", () => { sock = null })
-  s.on("error", () => { sock = null })
+  s.on("close", () => { if (sock === s) sock = null })
+  // Silently swallow post-connect errors — keepAlive's "close" listener will
+  // drive the reconnect. An unhandled 'error' event would crash the process.
+  s.on("error", () => { if (sock === s) sock = null })
 }
 
 function onMessage(msg: any): void {
@@ -261,21 +282,37 @@ let reconnecting = false
 
 async function keepAlive(): Promise<void> {
   while (true) {
-    await new Promise<void>((r) => {
-      if (!sock || sock.destroyed) return r()
-      sock.once("close", () => r())
-    })
-    if (reconnecting) continue
-    reconnecting = true
     try {
-      await registerSession()
-    } catch {
+      await new Promise<void>((r) => {
+        if (!sock || sock.destroyed) return r()
+        sock.once("close", () => r())
+      })
+      if (reconnecting) continue
+      reconnecting = true
+      try {
+        await registerSession()
+      } catch (err) {
+        process.stderr.write(`shim: reconnect failed, retrying: ${err}\n`)
+        await new Promise((r) => setTimeout(r, 1000))
+      } finally {
+        reconnecting = false
+      }
+    } catch (err) {
+      // Defensive: never let the keepAlive loop die.
+      process.stderr.write(`shim: keepAlive loop error: ${err}\n`)
       await new Promise((r) => setTimeout(r, 1000))
-    } finally {
-      reconnecting = false
     }
   }
 }
+
+// Prevent any stray rejection or uncaught exception from killing the shim
+// (which would cascade into Claude dropping the MCP server + Y-b pane dying).
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`shim: unhandledRejection ${err}\n`)
+})
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`shim: uncaughtException ${err}\n`)
+})
 
 await mcp.connect(new StdioServerTransport())
 await registerSession().catch((err) => process.stderr.write(`shim: register failed: ${err}\n`))
