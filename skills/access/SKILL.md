@@ -7,6 +7,7 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(tmux kill-window *)
 ---
 
 # /feishu:access — Feishu Channel Access Management
@@ -116,6 +117,28 @@ Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
 - `mentionPatterns`: JSON array of regex strings
 
 Read, set the key, write, confirm.
+
+### `threads` — list known threads and their states
+
+1. Read `~/.claude/channels/feishu/threads.json`; default to empty map if missing.
+2. For each entry, print one line in this shape:
+   `<thread_id>  <status>  <origin>  <cwd>  last_active=<relative time>`
+3. Group output by status: active first, then inactive, then closed.
+
+### `thread close <thread_id>` — archive a thread
+
+1. Read `~/.claude/channels/feishu/threads.json`.
+2. Set `threads[<thread_id>].status = "closed"`.
+3. Write back.
+4. Confirm; note that replies in closed threads get an auto "thread closed" reply.
+
+### `thread kill <thread_id>` — terminate a running session's tmux window
+
+1. Read threads.json; find the thread.
+2. If `status !== "active"`, tell the user nothing is running and stop.
+3. Look up `spawn_env.tmux_window_name`; fall back to `fb:<session_id_prefix>` if missing (prefix = first 8 chars of `session_id`).
+4. Run: `tmux kill-window -t claude-feishu:<window_name>`.
+5. Note: daemon observes the shim EOF and marks status=inactive automatically; no need to touch threads.json here.
 
 ---
 
