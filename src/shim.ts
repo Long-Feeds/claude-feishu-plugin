@@ -235,6 +235,20 @@ async function registerSession(): Promise<void> {
     op: "register", session_id: SESSION_ID, pid: process.pid, cwd: process.cwd(),
   })
   flushBuffer()
+  // Future-proof: if Claude Code exposes its session UUID via env, report it
+  // so daemon can persist claude_session_uuid for real `claude --resume <uuid>`
+  // on L2 revival. Today (Claude Code 2.1.x), no such env is set — daemon's
+  // L2 path falls back to plain `claude` in the same cwd, which means the
+  // revived thread is a conversation continuation, not a state resume.
+  const uuid =
+    process.env.CLAUDE_SESSION_UUID ||
+    process.env.CLAUDE_SESSION_ID ||
+    process.env.CLAUDECODE_SESSION_ID ||
+    process.env.CLAUDE_CODE_SESSION_ID ||
+    ""
+  if (uuid) {
+    request({ op: "session_info", claude_session_uuid: uuid }).catch(() => {})
+  }
   if (INITIAL_PROMPT_B64) {
     const decoded = Buffer.from(INITIAL_PROMPT_B64, "base64").toString("utf8")
     mcp.notification({
