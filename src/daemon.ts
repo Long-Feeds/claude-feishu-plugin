@@ -437,7 +437,7 @@ export class Daemon {
     const cmd = buildSpawnCommand({
       session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "Y-b",
     })
-    process.stderr.write(`daemon: spawnYb session=${session_id} cwd=${cwd} argv=${JSON.stringify(cmd.argv)}\n`)
+    process.stderr.write(`daemon: spawnYb session=${session_id} cwd=${cwd}\n`)
     if (this.cfg.spawnOverride) {
       await this.cfg.spawnOverride(cmd.argv, cmd.env)
     } else {
@@ -552,7 +552,7 @@ async function main(): Promise<void> {
       })
       ws = new lark.WSClient({
         appId: APP_ID!, appSecret: APP_SECRET!, domain: lark.Domain.Feishu,
-        loggerLevel: lark.LoggerLevel.debug,
+        loggerLevel: lark.LoggerLevel.info,
       })
       await ws.start({ eventDispatcher: dispatcher })
       process.stderr.write("daemon: WebSocket connected\n")

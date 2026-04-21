@@ -23,6 +23,9 @@ export function buildSpawnCommand(args: SpawnArgs): SpawnCommand {
     FEISHU_SESSION_ID: args.session_id,
     FEISHU_INITIAL_PROMPT: Buffer.from(args.initial_prompt, "utf8").toString("base64"),
   }
+  // Forward PATH so bash -c inside the tmux window can find `claude` and `bun`
+  // (tmux new-window doesn't reliably carry the caller's PATH).
+  if (process.env.PATH) env.PATH = process.env.PATH
   const claudeInvocation = args.kind === "resume" && args.claude_session_uuid
     ? `claude --resume "${args.claude_session_uuid}" || (echo "[resume-fail:$?]"; sleep 30)`
     : "claude"
