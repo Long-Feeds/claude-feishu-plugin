@@ -7,6 +7,8 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(systemctl --user *)
+  - Bash(journalctl --user *)
 ---
 
 # /feishu:configure — Feishu Channel Setup
@@ -85,6 +87,40 @@ offer.
 
 Delete the `FEISHU_APP_ID=` and `FEISHU_APP_SECRET=` lines (or the file if
 those are the only lines).
+
+### `install-service` — write and enable the systemd user service
+
+1. Resolve `${PLUGIN_ROOT}` to the plugin's absolute path (typically `$CLAUDE_PLUGIN_ROOT` or the caller's cwd if set). Resolve `${HOME}` to the user's home directory.
+2. Read the template at `${PLUGIN_ROOT}/systemd/claude-feishu.service.tmpl`.
+3. Replace literal `${PLUGIN_ROOT}` and `${HOME}` tokens in the template.
+4. `mkdir -p ~/.config/systemd/user`.
+5. Write the rendered unit to `~/.config/systemd/user/claude-feishu.service`.
+6. Run `systemctl --user daemon-reload`.
+7. Run `systemctl --user enable --now claude-feishu`.
+8. Wait ~1s, then `systemctl --user status claude-feishu --no-pager` and show the result.
+9. Tell the user: live logs are at `journalctl --user -u claude-feishu -f`.
+
+### `uninstall-service` — disable and remove the systemd user service
+
+1. Run `systemctl --user disable --now claude-feishu`.
+2. Remove `~/.config/systemd/user/claude-feishu.service`.
+3. Run `systemctl --user daemon-reload`.
+4. Confirm.
+
+### `set-hub <chat_id>` — set the hub chat for X-b sessions
+
+Hub chat is where X-b sessions (ones started manually in a terminal) create
+their threads. Y-b sessions (spawned by the daemon from a top-level Feishu
+message) use the triggering chat regardless of hub.
+
+1. Parse `$ARGUMENTS` for `<chat_id>`.
+2. Read `~/.claude/channels/feishu/access.json` (default if missing).
+3. Set `hubChatId: <chat_id>`.
+4. Write back.
+5. Confirm which chat_id was set.
+
+Note: `pair` should set `hubChatId` on the first successful pair if it's
+unset (so most users never need this command).
 
 ---
 
