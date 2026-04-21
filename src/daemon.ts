@@ -114,21 +114,44 @@ export class Daemon {
     try {
       conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
     } catch {}
-    // Fire the queued Y-b / resume triggering message as a normal inbound push
-    // so Claude processes it identically to a DM that just arrived. Delay ~3s
-    // so Claude's MCP handshake (initialize + initialized) completes first —
-    // notifications sent too early get dropped by the client. Only once per
-    // session; reconnect of the same session_id finds no entry and no-ops.
+    // Inject the triggering message into the spawned tmux pane as typed user
+    // input. Claude Code's welcome screen swallows MCP channel notifications
+    // sent before first interaction, so pushing through the socket (the normal
+    // path used for mid-session inbound messages) does nothing at startup.
+    // `tmux send-keys` simulates the user typing the prompt into the terminal,
+    // which reliably kicks Claude off the welcome screen AND triggers auto-
+    // processing. The 5s delay gives Claude time to finish booting past the
+    // welcome splash. The content is wrapped in the same <channel source="feishu">
+    // tag Claude Code normally renders for channel notifications, so Claude
+    // knows the chat_id/thread_id etc. when it calls the reply tool.
+    // Fires only once per session; reconnect of the same session_id finds no
+    // entry and no-ops.
     const pending = this.pendingYbInbound.get(session_id)
     if (pending) {
       this.pendingYbInbound.delete(session_id)
-      setTimeout(() => {
+      const m = pending.meta as Record<string, string | undefined>
+      const tags = [
+        `source="feishu"`,
+        m.chat_id && `chat_id="${m.chat_id}"`,
+        m.thread_id && `thread_id="${m.thread_id}"`,
+        m.message_id && `message_id="${m.message_id}"`,
+        m.user && `user="${m.user}"`,
+        m.ts && `ts="${m.ts}"`,
+      ].filter(Boolean).join(" ")
+      const wrapped = `<channel ${tags}>${pending.content}</channel>`
+      const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
+      const windowName = `fb:${session_id.slice(0, 8)}`
+      setTimeout(async () => {
         try {
-          conn.write(frame({ push: "inbound", content: pending.content, meta: pending.meta }))
+          const { spawn } = await import("child_process")
+          spawn("tmux", ["send-keys", "-t", `${tmuxSession}:${windowName}`, wrapped, "Enter"], {
+            stdio: "ignore",
+          }).unref()
+          process.stderr.write(`daemon: injected Y-b initial into tmux window ${windowName}\n`)
         } catch (err) {
-          process.stderr.write(`daemon: failed to deliver Y-b inbound for ${session_id}: ${err}\n`)
+          process.stderr.write(`daemon: Y-b tmux send-keys failed: ${err}\n`)
         }
-      }, 3000)
+      }, 5000)
     }
   }
 
