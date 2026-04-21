@@ -4,91 +4,72 @@ Bridges [Feishu (Lark)](https://www.feishu.cn/) messaging to a Claude Code sessi
 
 No public IP or webhook required — uses Feishu's WebSocket long connection.
 
+## Prerequisites
+
+- [Bun](https://bun.sh/) on `PATH` (runtime for both daemon and shim)
+- `tmux` on `PATH` (daemon spawns new Claude sessions as tmux windows)
+- systemd `--user` (Linux). macOS via launchd is future work.
+
 ## Architecture
 
 ```
-                    ┌──────────────────────┐
-                    │   Feishu / Lark App  │
-                    │   (mobile / desktop) │
-                    └──────────┬───────────┘
-                               │ user types message
-                               ▼
-                    ┌──────────────────────┐
-                    │  Feishu Open Platform│
-                    │  msg-frontier (WSS)  │
-                    └──────────┬───────────┘
-                               │ im.message.receive_v1
-                               │ (long-lived WebSocket — no public IP)
-                               ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │  server.ts  (this plugin — single-file MCP server)      │
-   │                                                         │
-   │   ┌─────────────┐    ┌──────────────┐    ┌──────────┐   │
-   │   │  WSClient   │───▶│ access gate  │───▶│  notify  │   │
-   │   │  (lark SDK) │    │ (access.json │    │  (MCP    │   │
-   │   └─────────────┘    │  pairing /   │    │  channel)│   │
-   │                      │  allowlist / │    └────┬─────┘   │
-   │                      │  groups)     │         │         │
-   │                      └──────┬───────┘         │         │
-   │                             │ drop / pair /   │         │
-   │                             │ deliver         │         │
-   │                             ▼                 │         │
-   │                  ┌────────────────────┐       │         │
-   │                  │  pairing reply     │       │         │
-   │                  │  via reply tool    │       │         │
-   │                  └────────────────────┘       │         │
-   │                                               │         │
-   │   tools exposed via MCP stdio  ◀──────────────┘         │
-   │   ┌──────┐ ┌──────┐ ┌────────────┐ ┌─────────────────┐  │
-   │   │reply │ │react │ │edit_message│ │download_attach. │  │
-   │   └──┬───┘ └──┬───┘ └─────┬──────┘ └────────┬────────┘  │
-   └──────┼────────┼───────────┼─────────────────┼───────────┘
-          │        │           │                 │
-          │ Feishu Open API (HTTPS, app-token)   │
-          │   im.message.create / .reply         │
-          │   im.messageReaction.create          │
-          │   im.message.patch                   │
-          │   im.messageResource.get             │
-          │        │           │                 │
-          ▼        ▼           ▼                 ▼
-                    ┌──────────────────────┐
-                    │  Feishu Open Platform│
-                    └──────────┬───────────┘
-                               │ delivered to chat
-                               ▼
-                    ┌──────────────────────┐
-                    │   Feishu / Lark App  │
-                    └──────────────────────┘
-
-   stdio (JSON-RPC)  ▲                ▲ /feishu:configure
-                     │                │ /feishu:access
-                     ▼                │ (terminal-only mutations)
-   ┌─────────────────────────────────────────────────────────┐
-   │              Claude Code (host process)                 │
-   │   spawns server.ts via .mcp.json → bun run start        │
-   └─────────────────────────────────────────────────────────┘
+                        ┌────────────────────────────┐
+                        │   Feishu Open Platform     │
+                        │   (WebSocket frontier)     │
+                        └──────────┬─────────────────┘
+                                   │ im.message.receive_v1 (WSS)
+                                   ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │  claude-feishu-daemon    (systemd --user service)           │
+    │                                                             │
+    │   WSClient  ─▶  gate (access.json)  ─▶  router              │
+    │                                          │                  │
+    │                                          ├─▶ thread_id 已知 │
+    │                                          │    → forward to  │
+    │                                          │       shim#N     │
+    │                                          └─▶ 顶层新消息      │
+    │                                               → spawn Y-b   │
+    │                                                              │
+    │   state:  access.json · threads.json · pending · inbox      │
+    │   listen: unix://~/.claude/channels/feishu/daemon.sock      │
+    └──────┬────────────────────────────────┬─────────────────────┘
+           │ JSON-line IPC                  │ tmux new-window -t claude-feishu
+           │                                ▼
+     ┌─────┴──────┐                ┌───────────────────────┐
+     │ shim #1    │ shim #2 ...    │  tmux session:        │
+     │ (MCP over  │                │  "claude-feishu"      │
+     │  stdio in  │                │  ┌─────┬─────┬─────┐  │
+     │  each      │                │  │ win │ win │ win │  │
+     │  Claude)   │                │  │  1  │  2  │  3  │  │
+     └─────┬──────┘                │  │Y-b  │Y-b  │X-b  │  │
+           │ stdio MCP             │  └─────┴─────┴─────┘  │
+           ▼                       │ (each win runs its own │
+     ┌───────────┐                 │  `claude` process with │
+     │ Claude    │                 │  shim attached)        │
+     │ Code      │                 │                        │
+     │ session   │                 │                        │
+     └───────────┘                 └───────────────────────┘
+                             user attaches: `tmux attach -t claude-feishu`
 
    State on disk:  ~/.claude/channels/feishu/
                      ├── .env          (FEISHU_APP_ID / FEISHU_APP_SECRET)
-                     ├── access.json   (dmPolicy, allowFrom, groups, pending)
-                     ├── approved/     (pairing handoff to server)
+                     ├── access.json   (dmPolicy, allowFrom, groups, pending, hubChatId)
+                     ├── threads.json  (thread_id → session binding)
+                     ├── daemon.sock   (Unix socket, 0600)
+                     ├── daemon.pid
+                     ├── approved/     (pairing handoff to daemon)
                      └── inbox/        (downloaded attachments)
 ```
 
-**Inbound path** — Feishu pushes events over a WebSocket long connection
-(no webhook, no public IP). The access gate decides per message: drop,
-issue a pairing code, or deliver to Claude Code as an MCP channel notification.
-
-**Outbound path** — Claude Code calls one of four MCP tools (`reply`,
-`react`, `edit_message`, `download_attachment`); the server translates them
-into Feishu Open API HTTPS calls with the app's tenant access token. The
-`reply` tool re-checks the target chat against the gate before sending,
-so a compromised Claude session can't broadcast to arbitrary chats.
+The daemon runs under systemd and is the sole holder of the Feishu WebSocket.
+Each `claude` session loads a thin MCP shim via `.mcp.json`; shims speak NDJSON
+over the daemon's Unix socket and translate MCP tool calls ↔ Feishu actions on
+behalf of their session.
 
 **Control plane** — `/feishu:configure` and `/feishu:access` are Claude Code
 skills the user runs from the terminal. They only edit local files
 (`.env`, `access.json`, `approved/`) — they never call Feishu directly,
-and the server is the only thing that talks to Feishu's API.
+and the daemon is the only thing that talks to Feishu's API.
 
 ## Quick Start
 
@@ -153,23 +134,32 @@ This saves credentials to `~/.claude/channels/feishu/.env` (chmod 600).
 2. In Claude Code: `/feishu:access pair <code>`
 3. The bot confirms pairing. You're connected!
 
-### 5. Launch Claude Code with the Channel
+### 5. Install the systemd daemon
 
-Start (or restart) Claude Code, loading the Feishu channel:
-
-```bash
-claude --dangerously-load-development-channels plugin:feishu@claude-feishu
+```
+/feishu:configure install-service
 ```
 
-This flag tells Claude Code to activate the channel plugin's MCP server.
-You should see `feishu channel: connected` in the debug output once the
-WebSocket to Feishu is established.
+This writes `~/.config/systemd/user/claude-feishu.service`, enables it, and
+starts the daemon. Verify with:
 
-> Once the plugin graduates from development to a published marketplace,
-> this flag will no longer be needed — a normal `claude` invocation will
-> load it automatically.
+```bash
+systemctl --user status claude-feishu
+```
 
-### 6. Lock Down Access
+Live logs: `journalctl --user -u claude-feishu -f`.
+
+### 6. Launch Claude Code normally
+
+Once the daemon is running, any `claude` session picks up the Feishu channel
+automatically via the installed plugin's `.mcp.json`. No special flag needed.
+
+Each top-level Feishu message to your bot will spawn a new Claude session as
+a window in the `claude-feishu` tmux session. Replies in a thread route to
+that session's shim; replies in an old (inactive) thread trigger `claude
+--resume` in the same cwd.
+
+### 7. Lock Down Access
 
 Once everyone is paired:
 
