@@ -144,9 +144,16 @@ export class Daemon {
       setTimeout(async () => {
         try {
           const { spawn } = await import("child_process")
-          spawn("tmux", ["send-keys", "-t", `${tmuxSession}:${windowName}`, wrapped, "Enter"], {
-            stdio: "ignore",
-          }).unref()
+          const target = `${tmuxSession}:${windowName}`
+          // Use -l (literal) for the text payload so tmux doesn't interpret
+          // any char (like $, backticks) as a keybinding. Then split off Enter
+          // into a second send-keys call with a short gap — Claude Code's
+          // input reader drops the Enter if it arrives in the same burst as
+          // the tail of the text.
+          spawn("tmux", ["send-keys", "-t", target, "-l", wrapped], { stdio: "ignore" }).unref()
+          setTimeout(() => {
+            spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" }).unref()
+          }, 300)
           process.stderr.write(`daemon: injected Y-b initial into tmux window ${windowName}\n`)
         } catch (err) {
           process.stderr.write(`daemon: Y-b tmux send-keys failed: ${err}\n`)

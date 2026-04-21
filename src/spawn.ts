@@ -26,9 +26,16 @@ export function buildSpawnCommand(args: SpawnArgs): SpawnCommand {
   // Forward PATH so bash -c inside the tmux window can find `claude` and `bun`
   // (tmux new-window doesn't reliably carry the caller's PATH).
   if (process.env.PATH) env.PATH = process.env.PATH
+  // Y-b and resume sessions are non-interactive — the "user" here is a Feishu
+  // sender, not someone at the terminal. Skip permission prompts so reply /
+  // react / edit_message / download_attachment calls don't block waiting for
+  // a human at the tmux pane. The feishu plugin's channel notifications (via
+  // shim) are the trust boundary; the user authorized the bot when they
+  // installed the plugin + configured the Feishu app credentials.
+  const claudeFlags = "--dangerously-skip-permissions"
   const claudeInvocation = args.kind === "resume" && args.claude_session_uuid
-    ? `claude --resume "${args.claude_session_uuid}" || (echo "[resume-fail:$?]"; sleep 30)`
-    : "claude"
+    ? `claude ${claudeFlags} --resume "${args.claude_session_uuid}" || (echo "[resume-fail:$?]"; sleep 30)`
+    : `claude ${claudeFlags}`
   if (args.kind === "resume" && args.claude_session_uuid) {
     env.FEISHU_RESUME_UUID = args.claude_session_uuid
   }
