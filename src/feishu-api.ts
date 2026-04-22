@@ -19,7 +19,7 @@ export type LarkLike = {
 
 const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"])
 
-export type TextFormat = "text" | "post"
+export type TextFormat = "text" | "post" | "markdown"
 
 export type SendResult = {
   message_id: string
@@ -27,6 +27,20 @@ export type SendResult = {
 }
 
 function buildContent(text: string, format: TextFormat): { content: string; msg_type: string } {
+  if (format === "markdown") {
+    // Feishu's post format with a single `md` element renders markdown (bold,
+    // italic, blockquotes, code fences, links). Unlike an `interactive` card,
+    // post-with-md still supports `reply_in_thread`, which we need for thread
+    // routing. Verified with the live API — interactive cards return
+    // "The request you send is not a valid operation" when replied into a
+    // thread, but post-with-md threads fine.
+    return {
+      content: JSON.stringify({
+        zh_cn: { title: "", content: [[{ tag: "md", text }]] },
+      }),
+      msg_type: "post",
+    }
+  }
   if (format === "post") {
     const lines = text.split("\n")
     return {

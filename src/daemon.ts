@@ -325,10 +325,18 @@ export class Daemon {
 
   private sendTerminalAnnounce(session_id: string, hub: string, cwd: string): void {
     if (!this.cfg.feishuApi) return
+    // Markdown format so the blockquote for cwd / session renders cleanly in
+    // the feishu chat UI. Rendering falls back to plain text on clients that
+    // don't support feishu post-md, and the source is still readable either way.
+    const text = [
+      `🟢 Claude Code session online`,
+      `> cwd: \`${cwd}\``,
+      `> session: \`${session_id}\``,
+    ].join("\n")
     this.cfg.feishuApi.sendRoot({
       chat_id: hub,
-      text: `🟢 Claude Code session online\ncwd: ${cwd}`,
-      format: "text",
+      text,
+      format: "markdown",
     }).then((res) => {
       // Prime pendingRoots so the session's first MCP reply seeds a thread
       // off this announce rather than creating a second root message. Also
@@ -542,19 +550,20 @@ export class Daemon {
     let prettyInput: string
     try { prettyInput = JSON.stringify(JSON.parse(msg.input_preview), null, 2) } catch { prettyInput = msg.input_preview }
     const text =
-      `🔐 Permission: ${msg.tool_name}\n\n` +
-      `Description: ${msg.description}\nInput:\n${prettyInput}\n\n` +
-      `Reply with: y ${msg.request_id} to allow, n ${msg.request_id} to deny`
+      `🔐 **Permission**: \`${msg.tool_name}\`\n` +
+      `> ${msg.description}\n\n` +
+      `\`\`\`json\n${prettyInput}\n\`\`\`\n\n` +
+      `Reply \`y ${msg.request_id}\` to allow or \`n ${msg.request_id}\` to deny.`
     if (this.cfg.feishuApi) {
       const bound = findBySessionId(this.threads, entry.session_id)
       if (bound) {
         this.cfg.feishuApi.sendInThread({
-          root_message_id: bound.root_message_id, text, format: "text", seed_thread: false,
+          root_message_id: bound.root_message_id, text, format: "markdown", seed_thread: false,
         }).catch((e) => { process.stderr.write(`daemon: permission relay (in-thread) failed: ${e}\n`) })
       } else {
         const hub = loadAccess(this.accessFile).hubChatId
         if (hub) {
-          this.cfg.feishuApi.sendRoot({ chat_id: hub, text, format: "text" })
+          this.cfg.feishuApi.sendRoot({ chat_id: hub, text, format: "markdown" })
             .catch((e) => { process.stderr.write(`daemon: permission relay (hub) failed: ${e}\n`) })
         }
       }
@@ -590,7 +599,7 @@ export class Daemon {
         await this.cfg.feishuApi.sendInThread({
           root_message_id: thread.root_message_id,
           text: msg.text,
-          format: "text",
+          format: "markdown",
           seed_thread: false,
         })
         this.threads.threads[thread.thread_id]!.last_message_at = Date.now()
@@ -624,7 +633,7 @@ export class Daemon {
         const res = await this.cfg.feishuApi.sendInThread({
           root_message_id: pending.root_message_id,
           text: msg.text,
-          format: "text",
+          format: "markdown",
           seed_thread: true,
         })
         if (res.thread_id) {
@@ -733,8 +742,8 @@ export class Daemon {
           }
           await this.cfg.feishuApi.sendInThread({
             root_message_id: rec.root_message_id,
-            text: "thread closed — send a new top-level message for a new session",
-            format: "text", seed_thread: false,
+            text: "🔒 **thread closed** — send a new top-level message for a new session",
+            format: "markdown", seed_thread: false,
           }).catch(() => {})
         }
         return
@@ -853,8 +862,8 @@ export class Daemon {
     const lead = isResend ? "Still pending" : "Pairing required"
     await this.cfg.feishuApi.sendRoot({
       chat_id: event.message.chat_id,
-      text: `${lead} — run in Claude Code:\n\n/feishu:access pair ${code}`,
-      format: "text",
+      text: `**${lead}** — run in Claude Code:\n\n\`/feishu:access pair ${code}\``,
+      format: "markdown",
     }).catch((e) => { process.stderr.write(`daemon: pair reply failed: ${e}\n`) })
   }
 
