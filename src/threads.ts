@@ -16,9 +16,20 @@ export type ThreadRecord = {
   spawn_env?: Record<string, string>
 }
 
+export type PendingRoot = {
+  chat_id: string
+  root_message_id: string
+  created_at: number
+}
+
 export type ThreadStore = {
   version: 1
   threads: Record<string, ThreadRecord>
+  // session_id → announce-root info. Populated when daemon posts a terminal
+  // auto-announce; consumed on the first MCP reply (which upgrades to a real
+  // thread binding under `threads`). Persisted so daemon restarts don't
+  // drop the announce state and re-announce on shim reconnect.
+  pendingRoots?: Record<string, PendingRoot>
 }
 
 // Back-compat: the `origin` field previously stored legacy shorthand values
@@ -42,14 +53,18 @@ export function loadThreads(file: string): ThreadStore {
     for (const rec of Object.values(parsed.threads)) {
       if (rec) rec.origin = migrateOrigin((rec as any).origin)
     }
-    return { version: 1, threads: parsed.threads }
+    return {
+      version: 1,
+      threads: parsed.threads,
+      pendingRoots: parsed.pendingRoots ?? {},
+    }
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
-    if (code === "ENOENT") return { version: 1, threads: {} }
+    if (code === "ENOENT") return { version: 1, threads: {}, pendingRoots: {} }
     try {
       renameSync(file, `${file}.corrupt-${Date.now()}`)
     } catch {}
-    return { version: 1, threads: {} }
+    return { version: 1, threads: {}, pendingRoots: {} }
   }
 }
 

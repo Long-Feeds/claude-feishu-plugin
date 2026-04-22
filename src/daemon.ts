@@ -91,7 +91,15 @@ export class Daemon {
   private accessFile: string
   private threadsFile: string
   private threads: ThreadStore
+  // pendingRoots: sessions that have an announce root posted but no thread
+  // binding yet (Claude hasn't called reply). Mirrors threads.pendingRoots on
+  // disk so this state survives daemon restart — a resumed terminal claude
+  // must not trigger a duplicate announce just because daemon was cycled.
   private pendingRoots = new Map<string, { chat_id: string; root_message_id: string }>()
+  // pendingFeishuRoots: feishu-spawn sessions waiting for their first reply
+  // to seed the thread on the user's original triggering message. In-memory
+  // only — feishu-spawn always has a concrete triggering message and will
+  // fire its first reply within seconds of spawn.
   private pendingFeishuRoots = new Map<string, { chat_id: string; root_message_id: string }>()
   // Terminal-origin sessions that registered while hubChatId was unset —
   // announce them once the first delivered inbound auto-populates the hub.
@@ -102,7 +110,27 @@ export class Daemon {
     this.accessFile = join(cfg.stateDir, "access.json")
     this.threadsFile = join(cfg.stateDir, "threads.json")
     this.threads = loadThreads(this.threadsFile)
+    // Hydrate in-memory pendingRoots from persistent store so daemon restarts
+    // preserve the "announced but not yet replied" state. Without this,
+    // restarting daemon between a terminal announce and Claude's first reply
+    // re-announces every shim reconnect.
+    for (const [sid, pr] of Object.entries(this.threads.pendingRoots ?? {})) {
+      this.pendingRoots.set(sid, { chat_id: pr.chat_id, root_message_id: pr.root_message_id })
+    }
     this.server = createServer((conn) => this.onConn(conn))
+  }
+
+  private persistPendingRoot(session_id: string, entry: { chat_id: string; root_message_id: string }): void {
+    if (!this.threads.pendingRoots) this.threads.pendingRoots = {}
+    this.threads.pendingRoots[session_id] = { ...entry, created_at: Date.now() }
+    saveThreads(this.threadsFile, this.threads)
+  }
+
+  private clearPendingRoot(session_id: string): void {
+    if (this.threads.pendingRoots && this.threads.pendingRoots[session_id]) {
+      delete this.threads.pendingRoots[session_id]
+      saveThreads(this.threadsFile, this.threads)
+    }
   }
 
   static async start(cfg: DaemonConfig): Promise<Daemon> {
@@ -299,8 +327,12 @@ export class Daemon {
       format: "text",
     }).then((res) => {
       // Prime pendingRoots so the session's first MCP reply seeds a thread
-      // off this announce rather than creating a second root message.
-      this.pendingRoots.set(session_id, { chat_id: hub, root_message_id: res.message_id })
+      // off this announce rather than creating a second root message. Also
+      // persist so a daemon restart between announce and first reply doesn't
+      // trigger a duplicate announce on shim reconnect.
+      const entry = { chat_id: hub, root_message_id: res.message_id }
+      this.pendingRoots.set(session_id, entry)
+      this.persistPendingRoot(session_id, entry)
       process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id}\n`)
       // Push a hint inbound to the shim so Claude knows it's bridged and
       // which chat_id to post updates to. Without this hint, terminal
@@ -402,7 +434,9 @@ export class Daemon {
           return
         }
         const res = await this.cfg.feishuApi.sendRoot({ chat_id: chat_home, text: msg.text, format })
-        this.pendingRoots.set(entry.session_id, { chat_id: chat_home, root_message_id: res.message_id })
+        const pr = { chat_id: chat_home, root_message_id: res.message_id }
+        this.pendingRoots.set(entry.session_id, pr)
+        this.persistPendingRoot(entry.session_id, pr)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: null }))
         return
       }
@@ -421,8 +455,9 @@ export class Daemon {
           origin: "terminal", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
         })
-        saveThreads(this.threadsFile, this.threads)
         this.pendingRoots.delete(entry.session_id)
+        this.clearPendingRoot(entry.session_id)   // also removes from disk
+        saveThreads(this.threadsFile, this.threads)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: res.thread_id }))
         return
       }

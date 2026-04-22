@@ -13,8 +13,8 @@ beforeEach(() => {
   file = join(mkdtempSync(join(tmpdir(), "threads-test-")), "threads.json")
 })
 
-test("empty load returns empty map", () => {
-  expect(loadThreads(file)).toEqual({ version: 1, threads: {} })
+test("empty load returns empty store", () => {
+  expect(loadThreads(file)).toEqual({ version: 1, threads: {}, pendingRoots: {} })
 })
 
 test("upsertThread persists and findByThreadId works", () => {

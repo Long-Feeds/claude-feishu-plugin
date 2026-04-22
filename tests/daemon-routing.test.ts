@@ -333,6 +333,55 @@ test("terminal register (fresh session, cwd matches existing terminal thread) re
   await daemon.stop()
 })
 
+test("terminal register with session_id whose announce is in pendingRoots (persisted) does NOT re-announce", async () => {
+  // Regression: `bun sync` cycles the daemon. If a terminal session had
+  // announced but not yet seen its first reply, the old in-memory-only
+  // pendingRoots was wiped → next shim reconnect looked "fresh" → duplicate
+  // announce. Fixed by persisting pendingRoots in threads.json.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const created: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { created.push(a); return { data: { message_id: "om_new" } } },
+        reply: async () => ({ data: {} }), patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Seed threads.json with a pending-root entry (no thread binding yet) —
+  // simulates daemon restart after announce but before Claude's first reply.
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.pendingRoots = {
+    "uuid-abc": { chat_id: "oc_hub", root_message_id: "om_previously_announced", created_at: Date.now() - 5000 },
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), () => {}))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({ id: 1, op: "register", session_id: "uuid-abc", pid: 1, cwd: "/proj" }))
+  await wait(50)
+
+  // alreadyPending was true via persisted pendingRoots → no duplicate announce
+  expect(created.length).toBe(0)
+  s.end()
+  await daemon.stop()
+})
+
 test("terminal register with known session_id (thread record exists) does NOT re-announce", async () => {
   // claude --resume: shim resolves Claude's UUID from /proc and sends it as
   // session_id. Daemon recognises the session from threads.json (prior Claude
