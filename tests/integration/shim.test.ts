@@ -74,7 +74,14 @@ test("shim without FEISHU_SESSION_ID persists daemon-assigned id across reconnec
   }
   await fd1.start()
 
-  const env = { ...process.env, FEISHU_DAEMON_SOCKET: sock } as any
+  const env = {
+    ...process.env,
+    FEISHU_DAEMON_SOCKET: sock,
+    // Tests run inside a real claude process; without this, the shim's
+    // /proc walk would find our test-runner's claude ancestor and report
+    // THAT jsonl's UUID instead of null.
+    FEISHU_SHIM_SKIP_UUID_PROBE: "1",
+  } as any
   delete env.FEISHU_SESSION_ID
   const shim = spawn("bun", ["src/shim.ts"], { env, stdio: ["pipe", "pipe", "inherit"] })
   shim.stdin.write(JSON.stringify({

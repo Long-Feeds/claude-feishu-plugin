@@ -14,7 +14,7 @@ import { connect, Socket } from "net"
 import { homedir } from "os"
 import { join } from "path"
 import { NdjsonParser, frame } from "./ipc"
-import { resolveClaudeCwd } from "./resolve-cwd"
+import { resolveClaudeCwd, findClaudeSessionUuid } from "./resolve-cwd"
 import { loadAccess } from "./access"
 
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), ".claude", "channels", "feishu")
@@ -294,6 +294,16 @@ pushHandlers.set("permission_reply", (m) => {
   }).catch(() => {})
 })
 
+async function waitForClaudeSessionUuid(maxMs: number): Promise<string | null> {
+  const deadline = Date.now() + maxMs
+  while (Date.now() < deadline) {
+    const uuid = findClaudeSessionUuid()
+    if (uuid) return uuid
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  return null
+}
+
 async function registerSession(): Promise<void> {
   await ensureConnected()
   // process.cwd() here is the plugin dir (Claude Code invokes us via
@@ -301,6 +311,18 @@ async function registerSession(): Promise<void> {
   // find the real claude session's cwd — that's the directory the user
   // cares about ("cwd" in the hub announce).
   const reportedCwd = resolveClaudeCwd()
+  // Prefer Claude Code's own session UUID — it's stable across
+  // `claude --resume`, and since the shim process restarts on each resume
+  // our in-memory `sessionId` cache is useless for continuity. Look for the
+  // UUID via /proc by inspecting the parent claude's open `.jsonl` fd. This
+  // has to poll briefly on fresh spawns because Claude opens the file
+  // slightly AFTER it spawns the MCP child.
+  if (!sessionId && !process.env.FEISHU_SHIM_SKIP_UUID_PROBE) {
+    sessionId = await waitForClaudeSessionUuid(1500)
+    if (sessionId) {
+      process.stderr.write(`shim: resolved claude session uuid=${sessionId}\n`)
+    }
+  }
   const resp = await request({
     op: "register", session_id: sessionId, pid: process.pid, cwd: reportedCwd,
   })

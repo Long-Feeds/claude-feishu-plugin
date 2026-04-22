@@ -74,15 +74,15 @@ test("register with existing session_id echoes it back", async () => {
 import { FeishuApi } from "../src/feishu-api"
 import { saveAccess, defaultAccess } from "../src/access"
 
-test("terminal first reply creates root msg; subsequent reply creates thread", async () => {
+test("terminal register auto-announces; first reply seeds thread on announce root; subsequent reply stays in thread", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
   const calls: any[] = []
   const api = new FeishuApi({
     im: {
       message: {
-        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "m1" } } },
-        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m2", thread_id: "t1" } } },
+        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "om_announce" } } },
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_reply", thread_id: "t1" } } },
         patch: async () => ({}),
       },
       messageReaction: { create: async () => ({}) },
@@ -102,8 +102,10 @@ test("terminal first reply creates root msg; subsequent reply creates thread", a
   s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => replies.push(m)))
   await new Promise<void>((r) => s.on("connect", () => r()))
 
+  // Shim provides a stable session_id (Claude UUID). Daemon has no prior
+  // state for "S1", so it auto-announces and primes pendingRoots.
   s.write(frame({ id: 1, op: "register", session_id: "S1", pid: 1, cwd: "/w" }))
-  await wait(30)
+  await wait(40)
   s.write(frame({ id: 2, op: "reply", text: "first", format: "text" }))
   await wait(30)
   s.write(frame({ id: 3, op: "reply", text: "second", format: "text" }))
@@ -111,9 +113,12 @@ test("terminal first reply creates root msg; subsequent reply creates thread", a
 
   const createdCalls = calls.filter((c) => c.op === "create")
   const replyCalls = calls.filter((c) => c.op === "reply")
+  // 1 create = the announce root. 2 replies = both land in the thread
+  // (first seeds via reply_in_thread=true, second stays with =false).
   expect(createdCalls.length).toBe(1)
-  expect(replyCalls.length).toBe(1)
+  expect(replyCalls.length).toBe(2)
   expect(replyCalls[0].a.data.reply_in_thread).toBe(true)
+  expect(replyCalls[1].a.data.reply_in_thread).toBe(false)
 
   s.end()
   await daemon.stop()
@@ -328,7 +333,11 @@ test("terminal register (fresh session, cwd matches existing terminal thread) re
   await daemon.stop()
 })
 
-test("terminal register (existing session_id, reconnect) does NOT re-announce", async () => {
+test("terminal register with known session_id (thread record exists) does NOT re-announce", async () => {
+  // claude --resume: shim resolves Claude's UUID from /proc and sends it as
+  // session_id. Daemon recognises the session from threads.json (prior Claude
+  // already replied at least once, so the thread binding exists) → skips the
+  // announce and routes into the existing thread.
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
   const created: any[] = []
@@ -346,6 +355,18 @@ test("terminal register (existing session_id, reconnect) does NOT re-announce", 
   const acc = defaultAccess(); acc.hubChatId = "oc_hub"
   saveAccess(join(dir, "access.json"), acc)
 
+  // Seed threads.json with a binding for this session_id, simulating a
+  // prior `claude` that had already replied (so we have a thread record).
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_existing"] = {
+    session_id: "01RECON", chat_id: "oc_hub", root_message_id: "om_root",
+    cwd: "/tmp", origin: "terminal", status: "inactive",
+    last_active_at: Date.now() - 1000, last_message_at: Date.now() - 1000,
+  }
+  st(threadsFile, store)
+
   const daemon = await Daemon.start({
     stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
   })
@@ -355,10 +376,10 @@ test("terminal register (existing session_id, reconnect) does NOT re-announce", 
   s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), () => {}))
   await new Promise<void>((r) => s.on("connect", () => r()))
 
-  // Reconnect path: shim sends a concrete session_id.
   s.write(frame({ id: 1, op: "register", session_id: "01RECON", pid: 1, cwd: "/tmp" }))
   await wait(50)
 
+  // alreadyBound is true via threads.json → announce skipped.
   expect(created.length).toBe(0)
   s.end()
   await daemon.stop()

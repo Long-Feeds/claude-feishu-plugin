@@ -190,22 +190,25 @@ export class Daemon {
   }
 
   private handleRegister(conn: Socket, msg: Extract<ShimReq, { op: "register" }>): void {
-    const isFreshRegistration = msg.session_id === null || msg.session_id === undefined
-
-    // Resume-dedup: `claude --resume` respawns the shim as a brand-new process,
-    // which loses the in-memory `sessionId` cache and sends null again. Without
-    // help, daemon treats this as a fresh terminal session and posts a new
-    // announce every restart. Detect the case by cwd: if there's an existing
-    // terminal-origin thread record for this cwd, adopt its session_id instead
-    // of minting a new one. Preserves thread continuity across claude restarts.
-    let session_id = msg.session_id ?? ulid()
-    let reusedFromCwd = false
-    if (isFreshRegistration && !this.pendingFeishuInbound.has(session_id)) {
+    // Primary continuity mechanism: the shim hands us Claude Code's session
+    // UUID (read from the parent claude process's open jsonl fd). That UUID
+    // is stable across `claude --resume` — same UUID means same conversation
+    // means same thread. So we just route on session_id without any cwd magic.
+    //
+    // Fallback: if shim couldn't resolve a UUID (e.g. fresh `claude` registered
+    // before it opened its jsonl), it sends null. We first try to recycle a
+    // prior terminal thread bound to the same cwd, then fall back to minting
+    // a fresh ULID.
+    let session_id: string
+    if (msg.session_id) {
+      session_id = msg.session_id
+    } else {
       const prior = findRecentTerminalThreadForCwd(this.threads, msg.cwd)
       if (prior) {
         session_id = prior.session_id
-        reusedFromCwd = true
-        process.stderr.write(`daemon: terminal register reused session=${session_id} from cwd=${msg.cwd} (thread=${prior.thread_id})\n`)
+        process.stderr.write(`daemon: terminal register (null session_id) reused session=${session_id} from cwd=${msg.cwd}\n`)
+      } else {
+        session_id = ulid()
       }
     }
 
@@ -223,21 +226,21 @@ export class Daemon {
     } catch {}
 
     // Terminal auto-announce: a fresh terminal `claude` invocation loads the
-    // plugin, shim registers with session_id=null, daemon assigns a ULID — but
-    // nothing was previously visible on Feishu, so the user couldn't tell the
-    // bridge was live or know which thread to reply in. Post a root "online"
+    // plugin, shim registers, daemon needs to surface the session somewhere
+    // on Feishu so the operator can reply into it. Post a root "online"
     // message to the hub and prime pendingRoots so the session's first MCP
     // reply seeds a thread off that announce (instead of creating a second
     // root). We skip:
     //   - feishu-spawned sessions (pendingFeishuInbound carries their trigger),
-    //   - reconnects (msg.session_id set → isFreshRegistration=false),
-    //   - sessions that already own a thread (resume revival path),
-    //   - resume-dedup matches (reusedFromCwd — we just adopted an old session).
+    //   - sessions that already own a thread (resume of a known session —
+    //     route into the existing thread, don't announce again),
+    //   - sessions that already have a pendingRoots entry (reconnect within
+    //     the same daemon lifetime).
     const isFeishuSpawn = this.pendingFeishuInbound.has(session_id)
     const alreadyBound = !!findBySessionId(this.threads, session_id)
     const alreadyPending = this.pendingRoots.has(session_id)
     if (
-      isFreshRegistration && !reusedFromCwd && !isFeishuSpawn && !alreadyBound && !alreadyPending &&
+      !isFeishuSpawn && !alreadyBound && !alreadyPending &&
       this.cfg.feishuApi
     ) {
       const hub = loadAccess(this.accessFile).hubChatId

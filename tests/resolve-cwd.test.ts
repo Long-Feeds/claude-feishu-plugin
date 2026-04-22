@@ -1,7 +1,8 @@
 import { test, expect } from "bun:test"
-import { resolveClaudeCwd, type ProcFs } from "../src/resolve-cwd"
+import { resolveClaudeCwd, findClaudeSessionUuid, type ProcFs } from "../src/resolve-cwd"
 
-function fakeFs(tree: Record<number, { ppid: number; comm: string; cwd: string }>): ProcFs {
+type Node = { ppid: number; comm: string; cwd: string; fds?: string[] }
+function fakeFs(tree: Record<number, Node>): ProcFs {
   return {
     readStatus: (pid) => {
       const n = tree[pid]
@@ -9,6 +10,7 @@ function fakeFs(tree: Record<number, { ppid: number; comm: string; cwd: string }
     },
     readCwd: (pid) => tree[pid]?.cwd ?? null,
     readComm: (pid) => tree[pid]?.comm ?? null,
+    listFds: (pid) => tree[pid]?.fds ?? [],
   }
 }
 
@@ -44,6 +46,44 @@ test("resolveClaudeCwd falls back to process.cwd when no claude ancestor", () =>
   // shim started directly under systemd (e.g. bare bun test run) — no claude
   // ancestor to find, so we fall back to process.cwd().
   expect(res).toBe(process.cwd())
+})
+
+test("findClaudeSessionUuid extracts uuid from claude's open jsonl fd", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
+    99:  { ppid: 98, comm: "bun", cwd: "/plugin" },
+    98:  {
+      ppid: 97, comm: "claude", cwd: "/home/me/proj",
+      fds: [
+        "/dev/null",
+        "/home/me/.claude/projects/-home-me-proj/3d40b615-a368-4cbf-8c03-d42f166883e9.jsonl",
+        "/home/me/.claude/history.jsonl",  // not a session jsonl
+      ],
+    },
+    97:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBe("3d40b615-a368-4cbf-8c03-d42f166883e9")
+})
+
+test("findClaudeSessionUuid returns null when claude hasn't opened a session jsonl yet", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
+    99:  { ppid: 98, comm: "claude", cwd: "/home/me/proj", fds: ["/dev/null"] },
+    98:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBeNull()
+})
+
+test("findClaudeSessionUuid handles a deleted jsonl fd marker", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
+    99:  {
+      ppid: 98, comm: "claude", cwd: "/home/me/proj",
+      fds: ["/home/me/.claude/projects/-proj/abcdef123456-7890-1234-5678-901234567890.jsonl (deleted)"],
+    },
+    98:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBe("abcdef123456-7890-1234-5678-901234567890")
 })
 
 test("resolveClaudeCwd respects maxDepth", () => {
