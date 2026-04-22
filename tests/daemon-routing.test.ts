@@ -254,6 +254,7 @@ test("terminal register pushes a bridge hint inbound so Claude knows to post upd
 
   const daemon = await Daemon.start({
     stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    bridgeHintDelayMs: 0, // skip production's 5s MCP-handshake wait
   })
 
   const s = connect(sock)
@@ -262,7 +263,7 @@ test("terminal register pushes a bridge hint inbound so Claude knows to post upd
   s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => frames.push(m)))
   await new Promise<void>((r) => s.on("connect", () => r()))
   s.write(frame({ id: 1, op: "register", session_id: null, pid: 1, cwd: "/tmp/xb" }))
-  await wait(80)
+  await wait(120)
 
   // Expect a push:inbound with feishu-bridge-hint source and the hub chat_id.
   const hint = frames.find((f) => f?.push === "inbound" && f?.meta?.source === "feishu-bridge-hint")

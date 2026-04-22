@@ -81,6 +81,7 @@ export type DaemonConfig = {
   tmuxSession?: string
   defaultCwd?: string
   spawnOverride?: (argv: string[], env: Record<string, string>) => Promise<number>
+  bridgeHintDelayMs?: number
 }
 
 export class Daemon {
@@ -289,25 +290,41 @@ export class Daemon {
       // gets routed through the existing push:inbound → shim → MCP channel
       // notification path, so Claude processes it exactly like any other
       // <channel> message and picks up chat_id for subsequent reply calls.
-      const entry = this.state.get(session_id)
-      if (entry) {
+      // Delay the hint so Claude's MCP handshake + welcome-screen
+      // processing has time to complete. Channel notifications delivered
+      // during MCP init get swallowed the same way the feishu-spawn initial
+      // prompt does (that's why feishu-spawn uses tmux send-keys with 5s
+      // delay); we don't own the terminal pane here, so we stick with MCP
+      // push but push late enough that Claude is actually listening.
+      // Tests override to 0 via config.
+      const hintDelay = this.cfg.bridgeHintDelayMs ?? 5000
+      setTimeout(() => {
+        const entry = this.state.get(session_id)
+        if (!entry) {
+          process.stderr.write(`daemon: bridge-hint SKIPPED session=${session_id} (shim no longer registered after 5s)\n`)
+          return
+        }
         try {
           entry.conn.write(frame({
             push: "inbound",
             content:
-              "Bridge hint (terminal session): this Claude is bridged to a Feishu group. " +
-              "The operator may or may not be watching the terminal — post concise " +
-              "progress updates via the `reply` tool with the chat_id below so remote " +
-              "observers can follow. You don't need to reply every line — key milestones " +
-              "and final results are enough.",
+              "⚡ FEISHU BRIDGE — this Claude session is mirroring to a Feishu group. " +
+              "IMPORTANT: after each meaningful milestone (task start, key finding, " +
+              "blocker, completion), you MUST call the feishu `reply` tool with " +
+              `chat_id="${hub}" and a concise one-paragraph summary. Remote observers ` +
+              "only see what you post via `reply` — your transcript does not reach them. " +
+              "Skip trivia; don't narrate every bash call. Aim for 3-6 updates per task.",
             meta: {
               chat_id: hub,
               initial: "true",
               source: "feishu-bridge-hint",
             },
           }))
-        } catch {}
-      }
+          process.stderr.write(`daemon: bridge-hint pushed to session=${session_id}\n`)
+        } catch (e) {
+          process.stderr.write(`daemon: bridge-hint push FAILED session=${session_id}: ${e}\n`)
+        }
+      }, hintDelay)
     }).catch((e) => process.stderr.write(`daemon: terminal auto-announce failed: ${e}\n`))
   }
 
