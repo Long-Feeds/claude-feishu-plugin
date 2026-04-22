@@ -147,9 +147,7 @@ const baseInstructions = [
 const bridgeInstructions = (HUB_CHAT_ID && !IS_FEISHU_SPAWN) ? [
   '',
   `⚡ FEISHU BRIDGE — this terminal session is mirroring to a Feishu group (chat_id=${HUB_CHAT_ID}).`,
-  'The operator at this terminal sees your transcript directly, but remote observers on Feishu only see what you post via the `reply` tool with the chat_id above.',
-  'After each meaningful milestone — task start, key finding, blocker, completion — call reply(chat_id="' + HUB_CHAT_ID + '", text="<one-paragraph summary>") so remote observers can follow.',
-  'Skip trivia (don\'t narrate every bash call or file read). Aim for 3-6 concise milestone updates per task.',
+  'IMPORTANT: a Stop-hook automatically posts your final response text to the Feishu thread after each turn. You do NOT need to call the `reply` tool for routine progress — that would duplicate the mirror. Only call `reply` explicitly when the operator on Feishu is NOT the terminal user (e.g. responding to an incoming <channel source="feishu"> message from a real Feishu user), or when you want to surface an intermediate checkpoint mid-turn that the hook wouldn\'t see.',
 ] : []
 
 const mcp = new Server(

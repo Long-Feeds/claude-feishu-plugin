@@ -9,7 +9,7 @@
     "daemon": "bun install --no-summary && bun src/daemon.ts",
     "shim": "bun src/shim.ts",
     "test": "bun test",
-    "sync": "rsync -a --delete src/ ${HOME}/.claude/plugins/cache/claude-feishu/feishu/0.0.1/src/ && rsync -a --delete src/ /data00/home/xiaolong.835/claude-feishu-plugin/src/ && systemctl --user restart claude-feishu"
+    "sync": "rsync -a --delete src/ ${HOME}/.claude/plugins/cache/claude-feishu/feishu/0.0.1/src/ && rsync -a --delete hooks/ ${HOME}/.claude/plugins/cache/claude-feishu/feishu/0.0.1/hooks/ && rsync -a --delete src/ /data00/home/xiaolong.835/claude-feishu-plugin/src/ && rsync -a --delete hooks/ /data00/home/xiaolong.835/claude-feishu-plugin/hooks/ && systemctl --user restart claude-feishu"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

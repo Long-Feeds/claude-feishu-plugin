@@ -434,6 +434,120 @@ test("terminal register with known session_id (thread record exists) does NOT re
   await daemon.stop()
 })
 
+test("hook_post routes by claude_session_uuid into that session's existing thread", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const replies: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: {} }),
+        reply: async (a) => { replies.push(a); return { data: { message_id: "m_hook" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Seed: session UUID already has a bound thread (Claude has replied before).
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_live"] = {
+    session_id: "uuid-live", chat_id: "oc_hub", root_message_id: "om_root",
+    cwd: "/proj", origin: "terminal", status: "active",
+    last_active_at: Date.now(), last_message_at: Date.now(),
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const out: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => out.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({
+    id: 1, op: "hook_post",
+    claude_session_uuid: "uuid-live",
+    cwd: "/proj",
+    text: "finished counting 5 lines",
+  }))
+  await wait(60)
+
+  expect(replies.length).toBe(1)
+  expect(replies[0].path.message_id).toBe("om_root")
+  expect(replies[0].data.reply_in_thread).toBe(false)  // existing thread, no re-seed
+  const ack = out.find((m) => m.id === 1)
+  expect(ack?.ok).toBe(true)
+  expect(ack?.thread_id).toBe("t_live")
+  s.end()
+  await daemon.stop()
+})
+
+test("hook_post with no thread but a pending announce root seeds the thread", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const replies: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: {} }),
+        reply: async (a) => { replies.push(a); return { data: { message_id: "m_seed", thread_id: "t_seeded" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Seed a pendingRoot (announced but not yet replied)
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.pendingRoots = {
+    "uuid-fresh": { chat_id: "oc_hub", root_message_id: "om_announce", created_at: Date.now() },
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), () => {}))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({
+    id: 1, op: "hook_post",
+    claude_session_uuid: "uuid-fresh",
+    cwd: "/proj/fresh",
+    text: "first hook event",
+  }))
+  await wait(60)
+
+  expect(replies.length).toBe(1)
+  expect(replies[0].path.message_id).toBe("om_announce")
+  expect(replies[0].data.reply_in_thread).toBe(true)  // seeds the thread
+
+  // pendingRoots[uuid-fresh] was consumed → threads binding is created
+  const after = (await import("../src/threads")).loadThreads(threadsFile)
+  expect(after.pendingRoots?.["uuid-fresh"]).toBeUndefined()
+  expect(Object.values(after.threads).some((r) => r.session_id === "uuid-fresh" && r.status === "active")).toBe(true)
+
+  s.end()
+  await daemon.stop()
+})
+
 test("delivered inbound message gets a 'received' emoji reaction on the trigger", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")

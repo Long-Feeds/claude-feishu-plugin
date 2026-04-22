@@ -6,7 +6,7 @@ import * as lark from "@larksuiteoapi/node-sdk"
 import { DaemonState } from "./daemon-state"
 import { NdjsonParser, frame, type ShimReq, type DaemonMsg } from "./ipc"
 import type { ReplyReq } from "./ipc"
-import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq } from "./ipc"
+import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq, HookPostReq } from "./ipc"
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
@@ -210,6 +210,7 @@ export class Daemon {
       case "download_attachment": return void this.handleDownload(conn, msg as DownloadReq)
       case "permission_request": return void this.handlePermissionRequest(conn, msg as PermissionReq)
       case "session_info": return void this.handleSessionInfo(conn, msg as SessionInfoReq)
+      case "hook_post": return void this.handleHookPost(conn, msg as HookPostReq)
       default:
         try {
           conn.write(frame({ id: (msg as any).id, ok: false, error: `unknown op: ${(msg as any).op}` }))
@@ -553,6 +554,76 @@ export class Daemon {
       }
     }
     try { conn.write(frame({ id: msg.id, ok: true })) } catch {}
+  }
+
+  private async handleHookPost(conn: Socket, msg: HookPostReq): Promise<void> {
+    // Plugin Stop-hook pushing "Claude just finished a turn, here's the text."
+    // Route to the terminal session's existing feishu thread so remote
+    // observers get the update without Claude having to call reply itself.
+    // Lookup order:
+    //   1. claude_session_uuid === any session's session_id (shim normally
+    //      uses the same UUID when it resolved the project-dir jsonl in time).
+    //   2. threads.json has a terminal thread record whose session_id matches
+    //      the UUID (same as #1 but via persistent store, e.g. after daemon
+    //      restart).
+    //   3. Fallback: newest terminal-origin thread bound to this cwd.
+    // If none match, drop silently — this is a best-effort mirror.
+    if (!this.cfg.feishuApi) {
+      try { conn.write(frame({ id: msg.id, ok: false, error: "feishu api not configured" })) } catch {}
+      return
+    }
+    const uuid = msg.claude_session_uuid
+    let thread: ThreadRecord & { thread_id: string } | undefined
+    if (uuid) thread = findBySessionId(this.threads, uuid)
+    if (!thread) {
+      const byCwd = findRecentTerminalThreadForCwd(this.threads, msg.cwd)
+      if (byCwd) thread = byCwd
+    }
+    try {
+      if (thread && thread.status !== "closed") {
+        await this.cfg.feishuApi.sendInThread({
+          root_message_id: thread.root_message_id,
+          text: msg.text,
+          format: "text",
+          seed_thread: false,
+        })
+        this.threads.threads[thread.thread_id]!.last_message_at = Date.now()
+        saveThreads(this.threadsFile, this.threads)
+        conn.write(frame({ id: msg.id, ok: true, thread_id: thread.thread_id }))
+        process.stderr.write(`daemon: hook_post routed to thread=${thread.thread_id} session=${thread.session_id}\n`)
+        return
+      }
+      // Session hasn't produced a thread binding yet — it's still in
+      // pendingRoots (announced but no MCP reply yet). Post as a threaded
+      // reply off the announce root; that becomes the thread seed.
+      const pending = uuid ? this.pendingRoots.get(uuid) : undefined
+      if (pending) {
+        const res = await this.cfg.feishuApi.sendInThread({
+          root_message_id: pending.root_message_id,
+          text: msg.text,
+          format: "text",
+          seed_thread: true,
+        })
+        if (res.thread_id) {
+          upsertThread(this.threads, res.thread_id, {
+            session_id: uuid, chat_id: pending.chat_id,
+            root_message_id: pending.root_message_id, cwd: msg.cwd,
+            origin: "terminal", status: "active",
+            last_active_at: Date.now(), last_message_at: Date.now(),
+          })
+          this.pendingRoots.delete(uuid)
+          this.clearPendingRoot(uuid)
+          saveThreads(this.threadsFile, this.threads)
+          process.stderr.write(`daemon: hook_post seeded thread=${res.thread_id} from pendingRoots session=${uuid}\n`)
+        }
+        conn.write(frame({ id: msg.id, ok: true }))
+        return
+      }
+      process.stderr.write(`daemon: hook_post NO ROUTE uuid=${uuid} cwd=${msg.cwd} — dropping\n`)
+      conn.write(frame({ id: msg.id, ok: false, error: "no thread or pendingRoot match" }))
+    } catch (err) {
+      try { conn.write(frame({ id: msg.id, ok: false, error: (err as Error).message })) } catch {}
+    }
   }
 
   private handleSessionInfo(conn: Socket, msg: SessionInfoReq): void {

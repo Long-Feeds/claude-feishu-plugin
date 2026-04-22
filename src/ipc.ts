@@ -80,6 +80,20 @@ export type SessionInfoReq = {
   claude_session_uuid: string
 }
 
+// External Stop-hook post: the plugin's `hooks/mirror-stop.ts` fires after
+// every Claude turn, extracts the last assistant message text, and ships it
+// here so the daemon can mirror it to the feishu thread for this session.
+// The hook is NOT a registered shim — it's a one-shot connection from a
+// separate process — so it supplies its own (claude_session_uuid, cwd)
+// instead of relying on socket state.
+export type HookPostReq = {
+  id: number
+  op: "hook_post"
+  claude_session_uuid: string
+  cwd: string
+  text: string
+}
+
 export type ShimReq =
   | RegisterReq
   | ReplyReq
@@ -88,6 +102,7 @@ export type ShimReq =
   | DownloadReq
   | PermissionReq
   | SessionInfoReq
+  | HookPostReq
 
 // ─── Daemon → shim responses & pushes ───────────────────────────────────
 
