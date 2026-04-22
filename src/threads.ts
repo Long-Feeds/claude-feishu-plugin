@@ -20,6 +20,12 @@ export type PendingRoot = {
   chat_id: string
   root_message_id: string
   created_at: number
+  // cwd is used as a fallback routing key when a hook_post arrives from a
+  // claude whose session_id (its real UUID) doesn't match the session_id
+  // daemon assigned the shim (e.g. shim couldn't resolve the UUID fast
+  // enough and fell back to a ULID). Without this, the hook message would
+  // be dropped because UUID ≠ ULID and daemon can't bridge the two.
+  cwd?: string
 }
 
 export type ThreadStore = {
@@ -111,6 +117,24 @@ export function markActive(store: ThreadStore, session_id: string): void {
 export function close(store: ThreadStore, thread_id: string): void {
   const rec = store.threads[thread_id]
   if (rec) rec.status = "closed"
+}
+
+// Scan pendingRoots for the newest entry matching `cwd`. Used when a
+// hook_post arrives with a different session_id than the one that holds
+// the announce (UUID vs ULID mismatch): the Stop hook has the real Claude
+// UUID, daemon's pendingRoots is keyed by whatever session_id the shim
+// registered with, so we fall back on cwd to bridge.
+export function findRecentPendingRootForCwd(
+  store: ThreadStore,
+  cwd: string,
+): { session_id: string; root: PendingRoot } | undefined {
+  if (!store.pendingRoots) return undefined
+  let best: { session_id: string; root: PendingRoot } | undefined
+  for (const [sid, pr] of Object.entries(store.pendingRoots)) {
+    if (pr.cwd !== cwd) continue
+    if (!best || pr.created_at > best.root.created_at) best = { session_id: sid, root: pr }
+  }
+  return best
 }
 
 // Find a terminal-origin thread record bound to `cwd`, newest first, skipping

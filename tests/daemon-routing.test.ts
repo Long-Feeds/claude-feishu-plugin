@@ -491,6 +491,63 @@ test("hook_post routes by claude_session_uuid into that session's existing threa
   await daemon.stop()
 })
 
+test("hook_post whose uuid doesn't match any session falls back to cwd-matching pendingRoot", async () => {
+  // This is the common shim-raced-out scenario: shim registered with a
+  // ULID (couldn't resolve claude UUID in time), announce primed
+  // pendingRoots[ULID], and the Stop hook fires with Claude's real UUID
+  // which doesn't match. Fallback: match on cwd.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const replies: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: {} }),
+        reply: async (a) => { replies.push(a); return { data: { message_id: "m_seed", thread_id: "t_from_cwd" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.pendingRoots = {
+    "01SHIMRACEDOUTULID": {
+      chat_id: "oc_hub", root_message_id: "om_announce",
+      created_at: Date.now(), cwd: "/proj/racey",
+    },
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), () => {}))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({
+    id: 1, op: "hook_post",
+    claude_session_uuid: "real-uuid-claude-knows",  // doesn't match pendingRoots key
+    cwd: "/proj/racey",
+    text: "post that would have been NO ROUTE before the cwd fallback",
+  }))
+  await wait(60)
+
+  expect(replies.length).toBe(1)
+  expect(replies[0].path.message_id).toBe("om_announce")
+  expect(replies[0].data.reply_in_thread).toBe(true)
+  s.end()
+  await daemon.stop()
+})
+
 test("hook_post with no thread but a pending announce root seeds the thread", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")

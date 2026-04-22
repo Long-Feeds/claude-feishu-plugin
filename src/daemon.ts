@@ -10,7 +10,7 @@ import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq, Hoo
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, findRecentTerminalThreadForCwd, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, findRecentTerminalThreadForCwd, findRecentPendingRootForCwd, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
 
@@ -120,7 +120,10 @@ export class Daemon {
     this.server = createServer((conn) => this.onConn(conn))
   }
 
-  private persistPendingRoot(session_id: string, entry: { chat_id: string; root_message_id: string }): void {
+  private persistPendingRoot(
+    session_id: string,
+    entry: { chat_id: string; root_message_id: string; cwd?: string },
+  ): void {
     if (!this.threads.pendingRoots) this.threads.pendingRoots = {}
     this.threads.pendingRoots[session_id] = { ...entry, created_at: Date.now() }
     saveThreads(this.threadsFile, this.threads)
@@ -330,10 +333,13 @@ export class Daemon {
       // Prime pendingRoots so the session's first MCP reply seeds a thread
       // off this announce rather than creating a second root message. Also
       // persist so a daemon restart between announce and first reply doesn't
-      // trigger a duplicate announce on shim reconnect.
+      // trigger a duplicate announce on shim reconnect. cwd is stored so
+      // hook_post can fall back to it if the hook's claude_session_uuid
+      // doesn't match the shim's registered session_id (common when the
+      // shim couldn't resolve the UUID in time and registered with a ULID).
       const entry = { chat_id: hub, root_message_id: res.message_id }
       this.pendingRoots.set(session_id, entry)
-      this.persistPendingRoot(session_id, entry)
+      this.persistPendingRoot(session_id, { ...entry, cwd })
       process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id}\n`)
       // Push a hint inbound to the shim so Claude knows it's bridged and
       // which chat_id to post updates to. Without this hint, terminal
@@ -596,8 +602,25 @@ export class Daemon {
       // Session hasn't produced a thread binding yet — it's still in
       // pendingRoots (announced but no MCP reply yet). Post as a threaded
       // reply off the announce root; that becomes the thread seed.
-      const pending = uuid ? this.pendingRoots.get(uuid) : undefined
-      if (pending) {
+      //
+      // First try uuid-keyed lookup; if that misses (the very common
+      // "shim registered under a ULID because it couldn't resolve the
+      // jsonl in time, but Stop-hook has the real UUID" case), fall back
+      // to finding the pending root by cwd match.
+      let pending = uuid ? this.pendingRoots.get(uuid) : undefined
+      let pendingSessionId = uuid
+      if (!pending) {
+        const byCwd = findRecentPendingRootForCwd(this.threads, msg.cwd)
+        if (byCwd) {
+          pending = this.pendingRoots.get(byCwd.session_id) ?? {
+            chat_id: byCwd.root.chat_id,
+            root_message_id: byCwd.root.root_message_id,
+          }
+          pendingSessionId = byCwd.session_id
+          process.stderr.write(`daemon: hook_post cwd-fallback matched session=${pendingSessionId} for uuid=${uuid}\n`)
+        }
+      }
+      if (pending && pendingSessionId) {
         const res = await this.cfg.feishuApi.sendInThread({
           root_message_id: pending.root_message_id,
           text: msg.text,
@@ -605,16 +628,24 @@ export class Daemon {
           seed_thread: true,
         })
         if (res.thread_id) {
+          // Bind under Claude's real UUID (what future hooks will use) so
+          // session-id routing works from now on.
           upsertThread(this.threads, res.thread_id, {
-            session_id: uuid, chat_id: pending.chat_id,
-            root_message_id: pending.root_message_id, cwd: msg.cwd,
+            session_id: uuid || pendingSessionId,
+            chat_id: pending.chat_id,
+            root_message_id: pending.root_message_id,
+            cwd: msg.cwd,
             origin: "terminal", status: "active",
             last_active_at: Date.now(), last_message_at: Date.now(),
           })
+          // Clear BOTH keys: the uuid key (if any), and the ULID key the
+          // shim registered under (pendingSessionId might be ≠ uuid).
           this.pendingRoots.delete(uuid)
+          this.pendingRoots.delete(pendingSessionId)
           this.clearPendingRoot(uuid)
+          this.clearPendingRoot(pendingSessionId)
           saveThreads(this.threadsFile, this.threads)
-          process.stderr.write(`daemon: hook_post seeded thread=${res.thread_id} from pendingRoots session=${uuid}\n`)
+          process.stderr.write(`daemon: hook_post seeded thread=${res.thread_id} (uuid=${uuid}, shim-session=${pendingSessionId})\n`)
         }
         conn.write(frame({ id: msg.id, ok: true }))
         return
