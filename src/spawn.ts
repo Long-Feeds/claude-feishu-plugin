@@ -1,6 +1,6 @@
 import { spawn as nodeSpawn } from "child_process"
 
-export type SpawnKind = "Y-b" | "resume"
+export type SpawnKind = "feishu" | "resume"
 
 export type SpawnArgs = {
   session_id: string
@@ -26,7 +26,7 @@ export function buildSpawnCommand(args: SpawnArgs): SpawnCommand {
   // Forward PATH so bash -c inside the tmux window can find `claude` and `bun`
   // (tmux new-window doesn't reliably carry the caller's PATH).
   if (process.env.PATH) env.PATH = process.env.PATH
-  // Y-b and resume sessions are non-interactive — the "user" here is a Feishu
+  // feishu-spawned and resume sessions are non-interactive — the "user" here is a Feishu
   // sender, not someone at the terminal. Skip permission prompts so reply /
   // react / edit_message / download_attachment calls don't block waiting for
   // a human at the tmux pane. The feishu plugin's channel notifications (via

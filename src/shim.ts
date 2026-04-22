@@ -14,10 +14,16 @@ import { connect, Socket } from "net"
 import { homedir } from "os"
 import { join } from "path"
 import { NdjsonParser, frame } from "./ipc"
+import { resolveClaudeCwd } from "./resolve-cwd"
 
 const STATE_DIR = process.env.FEISHU_STATE_DIR ?? join(homedir(), ".claude", "channels", "feishu")
 const SOCKET_PATH = process.env.FEISHU_DAEMON_SOCKET ?? join(STATE_DIR, "daemon.sock")
-const SESSION_ID = process.env.FEISHU_SESSION_ID ?? null
+// Initial session_id comes from env (set by daemon for feishu-spawn sessions)
+// or is null for terminal-origin sessions. Once the daemon assigns a ULID on
+// first register, we capture it in `sessionId` and reuse it on every reconnect
+// so daemon doesn't treat a reconnect as a fresh terminal registration (which
+// would spam `🟢 session online` announces to the hub on every daemon restart).
+let sessionId: string | null = process.env.FEISHU_SESSION_ID ?? null
 // FEISHU_INITIAL_PROMPT env is still set by the daemon for historical/debug
 // visibility, but we no longer consume it in the shim — the daemon now pushes
 // the full triggering inbound (with chat_id/thread_id/etc meta) after register,
@@ -256,14 +262,23 @@ pushHandlers.set("permission_reply", (m) => {
 
 async function registerSession(): Promise<void> {
   await ensureConnected()
+  // process.cwd() here is the plugin dir (Claude Code invokes us via
+  // `bun run --cwd ${CLAUDE_PLUGIN_ROOT} shim`). Walk the parent chain to
+  // find the real claude session's cwd — that's the directory the user
+  // cares about ("cwd" in the hub announce).
+  const reportedCwd = resolveClaudeCwd()
   const resp = await request({
-    op: "register", session_id: SESSION_ID, pid: process.pid, cwd: process.cwd(),
+    op: "register", session_id: sessionId, pid: process.pid, cwd: reportedCwd,
   })
+  // Capture the daemon-assigned id so every subsequent reconnect re-registers
+  // with the same session_id. This keeps daemon's handleRegister out of the
+  // "fresh terminal" branch and prevents duplicate auto-announces.
+  if (resp.session_id && !sessionId) sessionId = resp.session_id
   flushBuffer()
   // Future-proof: if Claude Code exposes its session UUID via env, report it
   // so daemon can persist claude_session_uuid for real `claude --resume <uuid>`
-  // on L2 revival. Today (Claude Code 2.1.x), no such env is set — daemon's
-  // L2 path falls back to plain `claude` in the same cwd, which means the
+  // on resume. Today (Claude Code 2.1.x), no such env is set — daemon's
+  // resume path falls back to plain `claude` in the same cwd, which means the
   // revived thread is a conversation continuation, not a state resume.
   const uuid =
     process.env.CLAUDE_SESSION_UUID ||
@@ -306,7 +321,7 @@ async function keepAlive(): Promise<void> {
 }
 
 // Prevent any stray rejection or uncaught exception from killing the shim
-// (which would cascade into Claude dropping the MCP server + Y-b pane dying).
+// (which would cascade into Claude dropping the MCP server + feishu-spawn pane dying).
 process.on("unhandledRejection", (err) => {
   process.stderr.write(`shim: unhandledRejection ${err}\n`)
 })

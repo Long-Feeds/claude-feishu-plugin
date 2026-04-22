@@ -16,12 +16,25 @@ import { extractTextAndAttachment } from "./inbound"
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
+// Emoji reactions we apply to inbound messages to give the sender a fast
+// non-verbal ack. Empty string = disabled. emoji_type is CASE-SENSITIVE —
+// unknown names return code 231001. Authoritative list:
+// docs/feishu-emoji-types.md (mirror of Feishu's server-docs emoji enum).
+//   doing   — "received, routing to a session" (before Claude has replied)
+//   closed  — "thread is archived, won't process"
+// `OnIt` = "我正在处理" is the cleanest semantic match for doing; `CrossMark`
+// (❌) for a closed thread is much clearer than any crying face.
+// We deliberately don't react on drop/pair: drop is silent by design, and
+// pair already gets a visible text response carrying the pairing code.
+const REACT_DOING = process.env.FEISHU_REACT_DOING ?? "OnIt"
+const REACT_CLOSED = process.env.FEISHU_REACT_CLOSED ?? "CrossMark"
+
 export type SendKeysMeta = {
   chat_id?: string; thread_id?: string; message_id?: string;
   user?: string; ts?: string;
   // Attachment passthroughs — the shim's MCP instructions tell Claude to Read
   // image_path when present and to call download_attachment on file_key.
-  // Dropping these tags here silently breaks image/file inbound on Y-b paths.
+  // Dropping these tags here silently breaks image/file inbound on feishu-spawned paths.
   image_path?: string;
   attachment_kind?: string;
   attachment_file_key?: string;
@@ -78,7 +91,10 @@ export class Daemon {
   private threadsFile: string
   private threads: ThreadStore
   private pendingRoots = new Map<string, { chat_id: string; root_message_id: string }>()
-  private pendingYbRoots = new Map<string, { chat_id: string; root_message_id: string }>()
+  private pendingFeishuRoots = new Map<string, { chat_id: string; root_message_id: string }>()
+  // Terminal-origin sessions that registered while hubChatId was unset —
+  // announce them once the first delivered inbound auto-populates the hub.
+  private deferredTerminalAnnounce = new Map<string, { cwd: string }>()
 
   private constructor(private cfg: DaemonConfig) {
     this.pidFile = join(cfg.stateDir, "daemon.pid")
@@ -173,6 +189,7 @@ export class Daemon {
   }
 
   private handleRegister(conn: Socket, msg: Extract<ShimReq, { op: "register" }>): void {
+    const isFreshRegistration = msg.session_id === null || msg.session_id === undefined
     const session_id = msg.session_id ?? ulid()
     this.state.register({
       session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
@@ -186,6 +203,32 @@ export class Daemon {
     try {
       conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
     } catch {}
+
+    // Terminal auto-announce: a fresh terminal `claude` invocation loads the
+    // plugin, shim registers with session_id=null, daemon assigns a ULID — but
+    // nothing was previously visible on Feishu, so the user couldn't tell the
+    // bridge was live or know which thread to reply in. Post a root "online"
+    // message to the hub and prime pendingRoots so the session's first MCP
+    // reply seeds a thread off that announce (instead of creating a second
+    // root). We skip:
+    //   - feishu-spawned sessions (pendingFeishuInbound carries their trigger),
+    //   - reconnects (msg.session_id set → isFreshRegistration=false),
+    //   - sessions that already own a thread (resume revival path).
+    const isFeishuSpawn = this.pendingFeishuInbound.has(session_id)
+    const alreadyBound = !!findBySessionId(this.threads, session_id)
+    const alreadyPending = this.pendingRoots.has(session_id)
+    if (
+      isFreshRegistration && !isFeishuSpawn && !alreadyBound && !alreadyPending &&
+      this.cfg.feishuApi
+    ) {
+      const hub = loadAccess(this.accessFile).hubChatId
+      if (hub) {
+        this.sendTerminalAnnounce(session_id, hub, msg.cwd)
+      } else {
+        this.deferredTerminalAnnounce.set(session_id, { cwd: msg.cwd })
+        process.stderr.write(`daemon: terminal session=${session_id} registered but hubChatId unset — deferred; first inbound will auto-populate + announce\n`)
+      }
+    }
     // Inject the triggering message into the spawned tmux pane as typed user
     // input. Claude Code's welcome screen swallows MCP channel notifications
     // sent before first interaction, so pushing through the socket (the normal
@@ -198,9 +241,9 @@ export class Daemon {
     // knows the chat_id/thread_id etc. when it calls the reply tool.
     // Fires only once per session; reconnect of the same session_id finds no
     // entry and no-ops.
-    const pending = this.pendingYbInbound.get(session_id)
+    const pending = this.pendingFeishuInbound.get(session_id)
     if (pending) {
-      this.pendingYbInbound.delete(session_id)
+      this.pendingFeishuInbound.delete(session_id)
       const m = pending.meta as SendKeysMeta
       const wrapped = wrapForSendKeys(m, pending.content)
       const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
@@ -218,12 +261,34 @@ export class Daemon {
           setTimeout(() => {
             spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" }).unref()
           }, 300)
-          process.stderr.write(`daemon: injected Y-b initial into tmux window ${windowName}\n`)
+          process.stderr.write(`daemon: injected feishu-spawn initial into tmux window ${windowName}\n`)
         } catch (err) {
-          process.stderr.write(`daemon: Y-b tmux send-keys failed: ${err}\n`)
+          process.stderr.write(`daemon: feishu-spawn tmux send-keys failed: ${err}\n`)
         }
       }, 5000)
     }
+  }
+
+  private sendTerminalAnnounce(session_id: string, hub: string, cwd: string): void {
+    if (!this.cfg.feishuApi) return
+    this.cfg.feishuApi.sendRoot({
+      chat_id: hub,
+      text: `🟢 Claude Code session online — cwd: ${cwd}`,
+      format: "text",
+    }).then((res) => {
+      // Prime pendingRoots so the session's first MCP reply seeds a thread
+      // off this announce rather than creating a second root message.
+      this.pendingRoots.set(session_id, { chat_id: hub, root_message_id: res.message_id })
+      process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id}\n`)
+    }).catch((e) => process.stderr.write(`daemon: terminal auto-announce failed: ${e}\n`))
+  }
+
+  private announceDeferredTerminalSessions(hub: string): void {
+    if (this.deferredTerminalAnnounce.size === 0) return
+    for (const [session_id, info] of this.deferredTerminalAnnounce) {
+      this.sendTerminalAnnounce(session_id, hub, info.cwd)
+    }
+    this.deferredTerminalAnnounce.clear()
   }
 
   private async handleReply(conn: Socket, msg: ReplyReq): Promise<void> {
@@ -239,31 +304,31 @@ export class Daemon {
     const format = msg.format ?? "text"
     const bound = findBySessionId(this.threads, entry.session_id)
     const pending = this.pendingRoots.get(entry.session_id)
-    const ybRoot = this.pendingYbRoots.get(entry.session_id)
+    const feishuRoot = this.pendingFeishuRoots.get(entry.session_id)
 
     try {
-      if (!bound && !pending && ybRoot) {
-        // First reply for Y-b: seed thread rooted on the user's triggering message.
+      if (!bound && !pending && feishuRoot) {
+        // First reply for feishu-spawned: seed thread rooted on the user's triggering message.
         const res = await this.cfg.feishuApi.sendInThread({
-          root_message_id: ybRoot.root_message_id, text: msg.text, format, seed_thread: true,
+          root_message_id: feishuRoot.root_message_id, text: msg.text, format, seed_thread: true,
         })
         if (!res.thread_id) {
-          conn.write(frame({ id: msg.id, ok: false, error: "Y-b thread creation returned no thread_id" }))
+          conn.write(frame({ id: msg.id, ok: false, error: "feishu-spawn thread creation returned no thread_id" }))
           return
         }
         upsertThread(this.threads, res.thread_id, {
-          session_id: entry.session_id, chat_id: ybRoot.chat_id,
-          root_message_id: ybRoot.root_message_id, cwd: entry.cwd,
-          origin: "Y-b", status: "active",
+          session_id: entry.session_id, chat_id: feishuRoot.chat_id,
+          root_message_id: feishuRoot.root_message_id, cwd: entry.cwd,
+          origin: "feishu", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
         })
         saveThreads(this.threadsFile, this.threads)
-        this.pendingYbRoots.delete(entry.session_id)
+        this.pendingFeishuRoots.delete(entry.session_id)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: res.thread_id }))
         return
       }
       if (!bound && !pending) {
-        // First reply for X-b: plain create in hub.
+        // First reply for terminal: plain create in hub.
         const access = loadAccess(this.accessFile)
         const chat_home = access.hubChatId
         if (!chat_home) {
@@ -287,7 +352,7 @@ export class Daemon {
         upsertThread(this.threads, res.thread_id, {
           session_id: entry.session_id, chat_id: pending.chat_id,
           root_message_id: pending.root_message_id, cwd: entry.cwd,
-          origin: "X-b", status: "active",
+          origin: "terminal", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
         })
         saveThreads(this.threadsFile, this.threads)
@@ -405,7 +470,7 @@ export class Daemon {
     if (!entry) return
     this.state.remove(entry.session_id)
     // Reflect shim disconnect in persistent state so `/feishu:access threads`
-    // and friends show realistic status. The thread stays — L2 revival brings
+    // and friends show realistic status. The thread stays — resume brings
     // it back up if the user replies into it later.
     if (findBySessionId(this.threads, entry.session_id)) {
       markInactive(this.threads, entry.session_id)
@@ -424,18 +489,45 @@ export class Daemon {
       await this.sendPairReply(event, decision.code, decision.isResend)
       return
     }
+    // Auto-populate hubChatId on the first delivered inbound event when it's
+    // still unset. Without this, terminal-session first-reply errors with
+    // "no Feishu hub chat configured — DM the bot first", which is a silent
+    // dead-end for users who start with group-only usage. Whichever chat
+    // first gets routed becomes the hub; later inbounds don't overwrite.
+    if (!access.hubChatId) {
+      access.hubChatId = event.message.chat_id
+      saveAccess(this.accessFile, access)
+      process.stderr.write(`daemon: hubChatId auto-set to ${access.hubChatId}\n`)
+      // Any terminal sessions that registered before hub existed deferred
+      // their "session online" announce. Now that hub is known, fire them
+      // so the user can see which terminal claudes are bridged.
+      this.announceDeferredTerminalSessions(access.hubChatId)
+    }
+    // Fast non-verbal ack so the sender knows their message was picked up even
+    // before Claude produces a reply (feishu-spawn can take multiple seconds).
+    // Fire-and-forget: reaction failures (unsupported emoji_type, API hiccup)
+    // must not stall routing.
+    if (REACT_DOING && this.cfg.feishuApi) {
+      this.cfg.feishuApi.reactTo(event.message.message_id, REACT_DOING)
+        .catch((e) => { process.stderr.write(`daemon: react(doing) failed: ${e}\n`) })
+    }
     const thread_id = event.message.thread_id
     if (thread_id) {
       const rec = findByThreadId(this.threads, thread_id)
       if (!rec) {
         // Unknown thread. In topic-mode groups, the *root* message of a new
         // topic already carries a thread_id (Feishu auto-threads). Treat as a
-        // fresh Y-b trigger and bind this thread_id to the new session up-front.
-        await this.spawnYb(event, thread_id)
+        // fresh feishu-spawn trigger and bind this thread_id to the new
+        // session up-front.
+        await this.spawnFeishu(event, thread_id)
         return
       }
       if (rec.status === "closed") {
         if (this.cfg.feishuApi) {
+          if (REACT_CLOSED) {
+            this.cfg.feishuApi.reactTo(event.message.message_id, REACT_CLOSED)
+              .catch((e) => { process.stderr.write(`daemon: react(closed) failed: ${e}\n`) })
+          }
           await this.cfg.feishuApi.sendInThread({
             root_message_id: rec.root_message_id,
             text: "thread closed — send a new top-level message for a new session",
@@ -460,9 +552,11 @@ export class Daemon {
             }))
           } catch {}
           if (this.cfg.feishuApi) {
+            // Case-sensitive per Feishu API: THUMBSUP (all caps) vs ThumbsDown
+            // (camel case). See docs/feishu-emoji-types.md.
             this.cfg.feishuApi.reactTo(
               event.message.message_id,
-              permMatch[1]!.toLowerCase().startsWith("y") ? "THUMBSUP" : "THUMBSDOWN",
+              permMatch[1]!.toLowerCase().startsWith("y") ? "THUMBSUP" : "ThumbsDown",
             ).catch(() => {})
           }
           return
@@ -507,12 +601,13 @@ export class Daemon {
           if (attachment.name) inboundMeta.attachment_name = attachment.name
         }
 
-        if (rec.origin === "Y-b") {
-          // Y-b: inject via tmux send-keys instead of MCP channel notification.
-          // Claude Code at the idle `❯` prompt after a completed task doesn't
-          // auto-process channel notifications — we saw it consistently drop
-          // round-2+ inbound during multi-turn testing. send-keys simulates
-          // user input, which reliably kicks Claude's input loop.
+        if (rec.origin === "feishu") {
+          // feishu-spawn: inject via tmux send-keys instead of MCP channel
+          // notification. Claude Code at the idle `❯` prompt after a completed
+          // task doesn't auto-process channel notifications — we saw it
+          // consistently drop round-2+ inbound during multi-turn testing.
+          // send-keys simulates user input, which reliably kicks Claude's
+          // input loop.
           const wrapped = wrapForSendKeys(inboundMeta as SendKeysMeta, text)
           const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
           const windowName = `fb:${rec.session_id.slice(0, 8)}`
@@ -530,7 +625,7 @@ export class Daemon {
           return
         }
 
-        // X-b: push via MCP channel notification (shim forwards to Claude).
+        // terminal: push via MCP channel notification (shim forwards to Claude).
         try {
           entry.conn.write(frame({
             push: "inbound",
@@ -543,11 +638,11 @@ export class Daemon {
         }
         return
       }
-      // Inactive → L2 resume.
+      // Inactive → resume.
       await this.resumeSession(rec, thread_id, event)
       return
     }
-    await this.spawnYb(event)
+    await this.spawnFeishu(event)
   }
 
   private async sendPairReply(event: FeishuEvent, code: string, isResend: boolean): Promise<void> {
@@ -562,9 +657,9 @@ export class Daemon {
 
   // Pending triggering-event payloads to be pushed to shim once it registers.
   // Keyed by session_id. Deleted on first firing.
-  private pendingYbInbound = new Map<string, { content: string; meta: Record<string, unknown> }>()
+  private pendingFeishuInbound = new Map<string, { content: string; meta: Record<string, unknown> }>()
 
-  private async spawnYb(event: FeishuEvent, preExistingThreadId?: string): Promise<void> {
+  private async spawnFeishu(event: FeishuEvent, preExistingThreadId?: string): Promise<void> {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
     const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
     const session_id = ulid()
@@ -575,7 +670,7 @@ export class Daemon {
     // Stash the triggering event as an inbound push the shim will deliver once
     // Claude's MCP handshake finishes. Carries the full meta (chat_id, etc.)
     // that Claude needs to call `reply` correctly.
-    this.pendingYbInbound.set(session_id, {
+    this.pendingFeishuInbound.set(session_id, {
       content: prompt,
       meta: {
         chat_id: event.message.chat_id,
@@ -599,12 +694,12 @@ export class Daemon {
       upsertThread(this.threads, preExistingThreadId, {
         session_id, chat_id: event.message.chat_id,
         root_message_id: event.message.message_id, cwd,
-        origin: "Y-b", status: "active",
+        origin: "feishu", status: "active",
         last_active_at: Date.now(), last_message_at: Date.now(),
       })
       saveThreads(this.threadsFile, this.threads)
     } else {
-      this.pendingYbRoots.set(session_id, {
+      this.pendingFeishuRoots.set(session_id, {
         chat_id: event.message.chat_id,
         root_message_id: event.message.message_id,
       })
@@ -612,9 +707,9 @@ export class Daemon {
 
     if (!this.cfg.spawnOverride) await ensureTmuxSession(tmux)
     const cmd = buildSpawnCommand({
-      session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "Y-b",
+      session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "feishu",
     })
-    process.stderr.write(`daemon: spawnYb session=${session_id} cwd=${cwd}\n`)
+    process.stderr.write(`daemon: spawnFeishu session=${session_id} cwd=${cwd}\n`)
     if (this.cfg.spawnOverride) {
       await this.cfg.spawnOverride(cmd.argv, cmd.env)
     } else {
@@ -645,11 +740,11 @@ export class Daemon {
     // Use extractTextAndAttachment so we handle post/text/interactive/etc
     // (the naive JSON.parse(content).text only works for plain text msgs).
     const { text: prompt, attachment } = extractTextAndAttachment(event)
-    // Stage the reply as a pendingYbInbound so handleRegister injects it via
-    // tmux send-keys once the respawned shim reconnects — same delivery path
-    // as fresh Y-b spawn. Without this, L2 revival would bring up a Claude
-    // pane with no idea why and silently drop the user's message.
-    this.pendingYbInbound.set(rec.session_id, {
+    // Stage the reply as a pendingFeishuInbound so handleRegister injects it
+    // via tmux send-keys once the respawned shim reconnects — same delivery
+    // path as fresh feishu-spawn. Without this, resume would bring up a
+    // Claude pane with no idea why and silently drop the user's message.
+    this.pendingFeishuInbound.set(rec.session_id, {
       content: prompt,
       meta: {
         chat_id: event.message.chat_id,
@@ -773,7 +868,11 @@ async function main(): Promise<void> {
       })
       ws = new lark.WSClient({
         appId: APP_ID!, appSecret: APP_SECRET!, domain: lark.Domain.Feishu,
-        loggerLevel: lark.LoggerLevel.info,
+        loggerLevel: (process.env.FEISHU_WS_LOG as any) === "debug"
+          ? lark.LoggerLevel.debug
+          : (process.env.FEISHU_WS_LOG as any) === "trace"
+            ? lark.LoggerLevel.trace
+            : lark.LoggerLevel.info,
       })
       await ws.start({ eventDispatcher: dispatcher })
       process.stderr.write("daemon: WebSocket connected\n")

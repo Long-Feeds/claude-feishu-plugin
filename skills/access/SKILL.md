@@ -70,7 +70,7 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 4. Add `senderId` to `allowFrom` (dedupe).
 5. Delete `pending[<code>]`.
 6. **If `access.hubChatId` is unset (undefined/null), set it to `chatId`.**
-   This is the chat X-b (local terminal) sessions will post their threads into
+   This is the chat terminal (local terminal) sessions will post their threads into
    when they call `reply`. First pair wins; rerun `/feishu:configure set-hub <chat_id>`
    to change later.
 7. Write the updated access.json.

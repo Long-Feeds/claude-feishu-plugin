@@ -20,7 +20,7 @@ test("upsertThread persists and findByThreadId works", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
     session_id: "S1", chat_id: "c1", root_message_id: "m1",
-    cwd: "/w", origin: "X-b", status: "active",
+    cwd: "/w", origin: "terminal", status: "active",
     last_active_at: 1, last_message_at: 1,
   })
   saveThreads(file, store)
@@ -32,7 +32,7 @@ test("findBySessionId reverse lookup", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
     session_id: "S1", chat_id: "c1", root_message_id: "m1",
-    cwd: "/w", origin: "X-b", status: "active",
+    cwd: "/w", origin: "terminal", status: "active",
     last_active_at: 1, last_message_at: 1,
   })
   const found = findBySessionId(store, "S1")
@@ -43,7 +43,7 @@ test("markInactive then markActive cycle", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
     session_id: "S1", chat_id: "c1", root_message_id: "m1",
-    cwd: "/w", origin: "X-b", status: "active",
+    cwd: "/w", origin: "terminal", status: "active",
     last_active_at: 1, last_message_at: 1,
   })
   markInactive(store, "S1")
@@ -56,7 +56,7 @@ test("close transitions to closed", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
     session_id: "S1", chat_id: "c1", root_message_id: "m1",
-    cwd: "/w", origin: "X-b", status: "inactive",
+    cwd: "/w", origin: "terminal", status: "inactive",
     last_active_at: 1, last_message_at: 1,
   })
   closeThread(store, "t1")
@@ -68,25 +68,25 @@ test("pruneInactive drops old inactive but keeps active, closed, and resumable",
   const now = Date.now()
   const old = now - 60 * 86400_000   // 60 days ago
   upsertThread(store, "t_old_inactive", {
-    session_id: "S1", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    session_id: "S1", chat_id: "c", root_message_id: "m", cwd: "/", origin: "terminal",
     status: "inactive", last_active_at: old, last_message_at: old,
   })
   upsertThread(store, "t_old_closed", {
-    session_id: "S2", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    session_id: "S2", chat_id: "c", root_message_id: "m", cwd: "/", origin: "terminal",
     status: "closed", last_active_at: old, last_message_at: old,
   })
   upsertThread(store, "t_active", {
-    session_id: "S3", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    session_id: "S3", chat_id: "c", root_message_id: "m", cwd: "/", origin: "terminal",
     status: "active", last_active_at: old, last_message_at: old,
   })
   upsertThread(store, "t_recent_inactive", {
-    session_id: "S4", chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    session_id: "S4", chat_id: "c", root_message_id: "m", cwd: "/", origin: "terminal",
     status: "inactive", last_active_at: now - 1000, last_message_at: now - 1000,
   })
-  // Resumable inactive — L2 would be able to `claude --resume` this, so keep.
+  // Resumable inactive — resume would be able to `claude --resume` this, so keep.
   upsertThread(store, "t_old_resumable", {
     session_id: "S5", claude_session_uuid: "uuid-keep",
-    chat_id: "c", root_message_id: "m", cwd: "/", origin: "X-b",
+    chat_id: "c", root_message_id: "m", cwd: "/", origin: "terminal",
     status: "inactive", last_active_at: old, last_message_at: old,
   })
 
@@ -101,7 +101,7 @@ test("markActive does NOT reopen closed threads", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
     session_id: "S1", chat_id: "c1", root_message_id: "m1",
-    cwd: "/w", origin: "X-b", status: "active",
+    cwd: "/w", origin: "terminal", status: "active",
     last_active_at: 1, last_message_at: 1,
   })
   closeThread(store, "t1")

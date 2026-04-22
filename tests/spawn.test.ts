@@ -1,13 +1,13 @@
 import { test, expect } from "bun:test"
 import { buildSpawnCommand } from "../src/spawn"
 
-test("Y-b spawn uses tmux new-window with cwd and session env", () => {
+test("feishu-spawn uses tmux new-window with cwd and session env", () => {
   const { argv, env } = buildSpawnCommand({
     session_id: "S1",
     cwd: "/home/me/workspace/foo",
     initial_prompt: "hello",
     tmux_session: "claude-feishu",
-    kind: "Y-b",
+    kind: "feishu",
   })
   expect(argv[0]).toBe("tmux")
   expect(argv).toContain("new-window")

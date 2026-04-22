@@ -28,7 +28,7 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
     │                                          │    → forward to  │
     │                                          │       shim#N     │
     │                                          └─▶ 顶层新消息      │
-    │                                               → spawn Y-b   │
+    │                                               → feishu-spawn│
     │                                                              │
     │   state:  access.json · threads.json · pending · inbox      │
     │   listen: unix://~/.claude/channels/feishu/daemon.sock      │
@@ -41,7 +41,8 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
      │  stdio in  │                │  ┌─────┬─────┬─────┐  │
      │  each      │                │  │ win │ win │ win │  │
      │  Claude)   │                │  │  1  │  2  │  3  │  │
-     └─────┬──────┘                │  │Y-b  │Y-b  │X-b  │  │
+     └─────┬──────┘                │  │feishu│feishu│terminal│
+                                   │  │      │      │        │
            │ stdio MCP             │  └─────┴─────┴─────┘  │
            ▼                       │ (each win runs its own │
      ┌───────────┐                 │  `claude` process with │
@@ -172,7 +173,7 @@ Once everyone is paired:
 Once the daemon is running (Step 5) and you're paired (Step 4), three flows
 are available. Each Feishu thread corresponds to one Claude Code session.
 
-### Flow 1 — DM the bot to spawn a new session (Y-b)
+### Flow 1 — DM the bot to spawn a new session (feishu-spawn)
 
 You're on mobile, want Claude to poke at something in `~/workspace`:
 
@@ -185,9 +186,9 @@ You're on mobile, want Claude to poke at something in `~/workspace`:
    updates land in the same thread.
 4. Reply in the thread to give Claude more context.
 5. Peek at the live session any time: `tmux attach -t claude-feishu` (each
-   Y-b spawn is its own window).
+   feishu-spawn is its own window).
 
-### Flow 2 — Local terminal session pushes updates to Feishu (X-b)
+### Flow 2 — Local terminal session pushes updates to Feishu (terminal)
 
 You're working in a terminal with `claude`, want Feishu pings on a long-running task:
 
@@ -202,7 +203,7 @@ You're working in a terminal with `claude`, want Feishu pings on a long-running 
    in that thread.
 5. You can answer in the thread to steer Claude remotely.
 
-### Flow 3 — Revive a dead session by replying in an old thread (L2)
+### Flow 3 — Revive a dead session by replying in an old thread (resume)
 
 Terminal closed, laptop slept, or you ran `tmux kill-window` — the session
 is gone but the thread in Feishu still exists (status=inactive).
@@ -212,13 +213,13 @@ is gone but the thread in Feishu still exists (status=inactive).
    in the original cwd and delivers your reply as its new prompt.
 3. Thread goes back to `active`.
 
-> ⚠️ **L2 today is conversation revival, not state resume.** Claude Code
+> ⚠️ **resume today is conversation revival, not state resume.** Claude Code
 > 2.1 doesn't expose its session UUID to MCP children, so the daemon can't
 > call `claude --resume <uuid>`. The revived session gets a clean Claude
 > context and your reply as the new task. It's the same cwd so files and
 > git state carry over, but Claude's prior reasoning does not. If Claude
 > Code later exposes the session UUID via env, the shim is already wired
-> to report it (see `src/shim.ts`) and L2 flips automatically to real
+> to report it (see `src/shim.ts`) and resume flips automatically to real
 > state resume.
 
 ### Managing sessions and threads
@@ -228,12 +229,12 @@ is gone but the thread in Feishu still exists (status=inactive).
 | `/feishu:access threads` | List all threads grouped by status (active / inactive / closed) |
 | `/feishu:access thread close <thread_id>` | Archive a thread — replies to it get "thread closed" auto-response |
 | `/feishu:access thread kill <thread_id>` | `tmux kill-window` on the session's window; daemon auto-flips status to inactive |
-| `/feishu:configure set-hub <chat_id>` | Change the hub chat for X-b sessions (first pair auto-sets this) |
+| `/feishu:configure set-hub <chat_id>` | Change the hub chat for terminal sessions (first pair auto-sets this) |
 | `/feishu:configure install-service` | (Re)install the systemd user service |
 | `/feishu:configure uninstall-service` | Disable + remove the systemd service |
 | `systemctl --user status claude-feishu` | Check daemon liveness |
 | `journalctl --user -u claude-feishu -f` | Live daemon logs |
-| `tmux attach -t claude-feishu` | Watch all spawned Y-b/L2 sessions |
+| `tmux attach -t claude-feishu` | Watch all spawned feishu/resume sessions |
 
 ### Permission requests
 

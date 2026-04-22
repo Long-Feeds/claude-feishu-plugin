@@ -74,7 +74,7 @@ test("register with existing session_id echoes it back", async () => {
 import { FeishuApi } from "../src/feishu-api"
 import { saveAccess, defaultAccess } from "../src/access"
 
-test("X-b first reply creates root msg; subsequent reply creates thread", async () => {
+test("terminal first reply creates root msg; subsequent reply creates thread", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
   const calls: any[] = []
@@ -119,7 +119,7 @@ test("X-b first reply creates root msg; subsequent reply creates thread", async 
   await daemon.stop()
 })
 
-test("top-level DM triggers Y-b spawn via injected spawn_cmd", async () => {
+test("top-level DM triggers feishu-spawn via injected spawn_cmd", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
   const spawned: string[][] = []
@@ -154,6 +154,258 @@ test("top-level DM triggers Y-b spawn via injected spawn_cmd", async () => {
   await daemon.stop()
 })
 
+test("first delivered inbound auto-populates hubChatId when unset", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]
+  // hubChatId intentionally unset.
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0, defaultCwd: "/tmp",
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_1", chat_id: "oc_autohub", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  const { loadAccess: la } = await import("../src/access")
+  const after = la(join(dir, "access.json"))
+  expect(after.hubChatId).toBe("oc_autohub")
+  await daemon.stop()
+})
+
+test("terminal register (fresh session, hub configured) auto-announces and primes thread root", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const created: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { created.push(a); return { data: { message_id: "om_announce" } } },
+        reply: async () => ({ data: { message_id: "m2", thread_id: "t1" } }),
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"; acc.allowFrom = ["ou_abc"]
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const replies: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => replies.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+
+  // session_id=null → fresh terminal session (shim without FEISHU_SESSION_ID env)
+  s.write(frame({ id: 1, op: "register", session_id: null, pid: 1, cwd: "/tmp/xb" }))
+  await wait(50)
+
+  expect(created.length).toBe(1)
+  expect(created[0].data.receive_id).toBe("oc_hub")
+  // The announce should mention cwd so the user can tell which session lit up.
+  expect(created[0].data.content).toContain("/tmp/xb")
+
+  // Claude's first reply should now seed a thread off the announce message
+  // rather than creating a second root (pendingRoots primed by the announce).
+  s.write(frame({ id: 2, op: "reply", text: "hello", format: "text" }))
+  await wait(50)
+  expect(created.length).toBe(1) // no second root create
+  s.end()
+  await daemon.stop()
+})
+
+test("terminal register (existing session_id, reconnect) does NOT re-announce", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const created: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { created.push(a); return { data: { message_id: "om_x" } } },
+        reply: async () => ({ data: {} }), patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), () => {}))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+
+  // Reconnect path: shim sends a concrete session_id.
+  s.write(frame({ id: 1, op: "register", session_id: "01RECON", pid: 1, cwd: "/tmp" }))
+  await wait(50)
+
+  expect(created.length).toBe(0)
+  s.end()
+  await daemon.stop()
+})
+
+test("delivered inbound message gets a 'received' emoji reaction on the trigger", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const reactions: { message_id: string; emoji_type: string }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: {
+        create: async (a) => {
+          reactions.push({
+            message_id: a.path.message_id,
+            emoji_type: a.data.reaction_type.emoji_type,
+          })
+          return {}
+        },
+      },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_trigger", chat_id: "oc_dm", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(50)
+
+  const trigger = reactions.find((r) => r.message_id === "om_trigger")
+  expect(trigger).toBeDefined()
+  expect(trigger!.emoji_type).toBe("OnIt")
+  await daemon.stop()
+})
+
+test("dropped message (disallowed sender) gets no reaction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const reactions: { message_id: string; emoji_type: string }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: {
+        create: async (a) => {
+          reactions.push({
+            message_id: a.path.message_id,
+            emoji_type: a.data.reaction_type.emoji_type,
+          })
+          return {}
+        },
+      },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = []; acc.dmPolicy = "disabled"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_stranger" }, sender_type: "user" },
+    message: {
+      message_id: "om_dropped", chat_id: "oc_dm", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(50)
+
+  expect(reactions.length).toBe(0)
+  await daemon.stop()
+})
+
+test("reply into closed thread gets a distinct 'closed' reaction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const reactions: { message_id: string; emoji_type: string }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: {
+        create: async (a) => {
+          reactions.push({
+            message_id: a.path.message_id,
+            emoji_type: a.data.reaction_type.emoji_type,
+          })
+          return {}
+        },
+      },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_closed"] = {
+    session_id: "S_DEAD", chat_id: "oc_dm", root_message_id: "m0", cwd: "/tmp",
+    origin: "feishu", status: "closed",
+    last_active_at: 0, last_message_at: 0,
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0, defaultCwd: "/tmp",
+  })
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_into_closed", chat_id: "oc_dm", chat_type: "p2p",
+      thread_id: "t_closed",
+      message_type: "text", content: '{"text":"anyone there?"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(50)
+
+  const onTrigger = reactions.filter((r) => r.message_id === "om_into_closed").map((r) => r.emoji_type)
+  expect(onTrigger).toContain("CrossMark")
+  await daemon.stop()
+})
+
 test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
@@ -176,7 +428,7 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   store.threads["t1"] = {
     session_id: "S_OLD", claude_session_uuid: "uuid-xyz",
     chat_id: "oc_dm", root_message_id: "m0", cwd: "/tmp",    // use /tmp so it exists
-    origin: "Y-b", status: "inactive",
+    origin: "feishu", status: "inactive",
     last_active_at: 0, last_message_at: 0,
   }
   st(threadsFile, store)
@@ -198,10 +450,10 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   expect(spawned.length).toBe(1)
   expect(spawned[0]!.env.FEISHU_RESUME_UUID).toBe("uuid-xyz")
   expect(spawned[0]!.env.FEISHU_SESSION_ID).toBe("S_OLD")
-  // L2 regression guard: the reply text must be staged for injection into
+  // resume regression guard: the reply text must be staged for injection into
   // the respawned pane. Without this, revival spawns Claude with no prompt
   // and the user's message disappears.
-  const pending = (daemon as any).pendingYbInbound.get("S_OLD")
+  const pending = (daemon as any).pendingFeishuInbound.get("S_OLD")
   expect(pending).toBeDefined()
   expect(pending.content).toBe("continue")
   expect(pending.meta.thread_id).toBe("t1")

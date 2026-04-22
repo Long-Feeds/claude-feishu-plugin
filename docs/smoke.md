@@ -1,7 +1,7 @@
 # Smoke Checklist — Multi-Session Feishu Bridge
 
 Walk this list after deploying a fresh daemon or after changes that touch WS
-event delivery, spawning, or IPC. The Y-b / X-b / L2 / restart items listed
+event delivery, spawning, or IPC. The feishu-spawn / terminal / resume / restart items listed
 below each have an "auto" path using `lark-cli` so they can be driven from a
 script without a human at the Feishu app.
 
@@ -64,7 +64,7 @@ Resulting `groups` entry:
 }
 ```
 
-### 4. Y-b auto-spawn and auto-reply (full end-to-end)
+### 4. feishu-spawn auto-spawn and auto-reply (full end-to-end)
 
 ```bash
 send "告诉我当前工作目录"
@@ -75,10 +75,10 @@ Within ~15 seconds, expect:
 ```bash
 # A new tmux window named fb:<ulid-prefix> exists:
 tmux list-windows -t claude-feishu
-# threads.json has a new entry with origin=Y-b, status=active:
+# threads.json has a new entry with origin=feishu-spawn, status=active:
 cat ~/.claude/channels/feishu/threads.json
 # daemon logged the spawn + inject:
-journalctl --user -u claude-feishu -n 50 | grep -E 'inbound event|spawnYb|injected Y-b'
+journalctl --user -u claude-feishu -n 50 | grep -E 'inbound event|spawnFeishu|injected feishu-spawn'
 # The spawned claude auto-processed and called reply → thread has 2 messages:
 lark-cli im +threads-messages-list --thread <new_thread_id> --as bot \
   | grep -E '"content"|"sender_type"'
@@ -86,7 +86,7 @@ lark-cli im +threads-messages-list --thread <new_thread_id> --as bot \
 
 Flow internals, for debugging:
 
-- Feishu → daemon WS → `deliverFeishuEvent` → gate `deliver` → `spawnYb`
+- Feishu → daemon WS → `deliverFeishuEvent` → gate `deliver` → `spawnFeishu`
 - Daemon stores triggering meta in `pendingYbInbound[session_id]`
 - `tmux new-window ... claude --dangerously-skip-permissions`
 - After 5s, daemon `tmux send-keys -l <channel source="feishu" chat_id=...>text</channel>`
@@ -108,18 +108,18 @@ session regardless of which came first.
 
 ### 6. Multi-turn routing in a single thread (lark-cli automatable)
 
-Sends N follow-up @mentions into an existing Y-b thread and verifies that
+Sends N follow-up @mentions into an existing feishu-spawn thread and verifies that
 each is routed to the same session and that Claude replies in sequence.
 
 Use `lark-cli im +messages-reply --reply-in-thread` to keep the follow-ups
 inside the existing topic (non-@ replies get gated by Feishu and never reach
 the daemon — see §9 "Known rough edges"). The script below drives 3 rounds
-after the initial Y-b spawn:
+after the initial feishu-spawn spawn:
 
 ```bash
 TAG='<at user_id="'"$BOT_OPEN_ID"'">bot</at>'
 
-# Round 1: spawn a fresh Y-b session
+# Round 1: spawn a fresh feishu-spawn session
 R1=$(lark-cli im +messages-send --chat-id "$TEST_CHAT" \
   --text "$TAG 多轮测试 R1: 1+1 等于几" --as bot)
 R1_ID=$(echo "$R1" | grep -oE 'om_[a-zA-Z0-9]+' | head -1)
@@ -167,11 +167,11 @@ Pass criteria:
   `session_id` and `thread_id` stay fixed.
 - The final thread dump shows alternating lark-cli prompt / Claude reply pairs.
 
-> **Why send-keys, not MCP notification?** For Y-b sessions, subsequent
+> **Why send-keys, not MCP notification?** For feishu-spawn sessions, subsequent
 > inbound messages are injected via `tmux send-keys` (same path as the
 > initial prompt). Claude Code at an idle `❯` prompt after completing a
 > turn silently drops `notifications/claude/channel` messages sent via MCP,
-> so we route through the tmux pane instead. X-b sessions keep the MCP
+> so we route through the tmux pane instead. terminal sessions keep the MCP
 > notification path since they don't have a daemon-owned pane.
 
 ### 7. Thread-reply routing from a real human account (not automated)
@@ -182,10 +182,10 @@ to @mentions only for bot receivers. A human account's reply in the thread
 entry FOUND → send-keys inbound` log sequence, and that Claude processes +
 replies in-thread.
 
-### 8. L2 revival (not automated; needs human reply)
+### 8. resume revival (not automated; needs human reply)
 
 ```bash
-# Kill a Y-b window manually:
+# Kill a feishu-spawn window manually:
 tmux kill-window -t claude-feishu:fb:<id>
 # Verify threads.json status flips to "inactive":
 cat ~/.claude/channels/feishu/threads.json
@@ -218,14 +218,14 @@ send "reply in closed thread"                     # bot auto-replies "thread clo
 
 - **cwd is global** (`~/workspace` or `FEISHU_DEFAULT_CWD`). Per-chat or
   per-message cwd selection is planned but not in this release.
-- **L2 is conversation revival, not state resume.** Claude Code 2.1 doesn't
+- **resume is conversation revival, not state resume.** Claude Code 2.1 doesn't
   expose its session UUID to MCP children, so resume runs a fresh session in
   the same cwd with the user's reply as the initial prompt. Shim already has
   the forward-compat hook for when this changes.
-- **Topic-mode groups** auto-thread every root @mention → each is a new Y-b
+- **Topic-mode groups** auto-thread every root @mention → each is a new feishu-spawn
   session. If you want to keep one long thread, reply **into** that topic from
   your Feishu UI rather than starting a new top-level @mention.
-- **lark-cli testing covers Y-b only.** Thread replies (step 6) and L2 revival
+- **lark-cli testing covers feishu-spawn only.** Thread replies (step 6) and resume revival
   (step 7) need a real user account to fire because Feishu gates group
   delivery to @mention events only, and lark-cli as another bot gets filtered.
 
@@ -235,6 +235,6 @@ send "reply in closed thread"                     # bot auto-replies "thread clo
 |---|---|
 | `daemon: WebSocket connected` but no `inbound event` on @mention | Stray `bun server.ts` or another app instance holding the WSClient slot. `pkill -f 'bun server.ts'` and `systemctl --user restart claude-feishu`. |
 | tmux window opens but instantly closes | Inside the window, claude exited non-zero. Usually PATH — check systemd unit has `Environment=PATH=${HOME}/.local/bin:${HOME}/.bun/bin:...`. |
-| Window up, but prompt never submits | `tmux send-keys` Enter didn't land. Fix is already in daemon (split literal text + Enter with 300ms gap); if you see this, check the daemon log for `injected Y-b initial into tmux window` and manually `tmux send-keys -t <session>:<window> Enter`. |
+| Window up, but prompt never submits | `tmux send-keys` Enter didn't land. Fix is already in daemon (split literal text + Enter with 300ms gap); if you see this, check the daemon log for `injected feishu-spawn initial into tmux window` and manually `tmux send-keys -t <session>:<window> Enter`. |
 | Permission prompt blocks reply | `--dangerously-skip-permissions` missing from spawn argv. Check `src/spawn.ts`. |
-| `no server running on /tmp/tmux-1001/default` after any op | tmux session `claude-feishu` had no windows and the server self-terminated. Next Y-b spawn will `ensureTmuxSession` and recreate. Benign. |
+| `no server running on /tmp/tmux-1001/default` after any op | tmux session `claude-feishu` had no windows and the server self-terminated. Next feishu-spawn spawn will `ensureTmuxSession` and recreate. Benign. |

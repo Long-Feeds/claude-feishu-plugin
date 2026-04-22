@@ -107,11 +107,11 @@ those are the only lines).
 3. Run `systemctl --user daemon-reload`.
 4. Confirm.
 
-### `set-hub <chat_id>` — set the hub chat for X-b sessions
+### `set-hub <chat_id>` — set the hub chat for terminal sessions
 
-Hub chat is where X-b sessions (ones started manually in a terminal) create
-their threads. Y-b sessions (spawned by the daemon from a top-level Feishu
-message) use the triggering chat regardless of hub.
+Hub chat is where terminal sessions (ones started manually in a terminal)
+create their threads. feishu-spawn sessions (spawned by the daemon from a
+top-level Feishu message) use the triggering chat regardless of hub.
 
 1. Parse `$ARGUMENTS` for `<chat_id>`.
 2. Read `~/.claude/channels/feishu/access.json` (default if missing).

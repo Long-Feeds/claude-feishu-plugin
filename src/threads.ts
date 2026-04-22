@@ -1,13 +1,15 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from "fs"
 import { dirname } from "path"
 
+export type ThreadOrigin = "terminal" | "feishu"
+
 export type ThreadRecord = {
   session_id: string
   claude_session_uuid?: string
   chat_id: string
   root_message_id: string
   cwd: string
-  origin: "X-b" | "Y-b"
+  origin: ThreadOrigin
   status: "active" | "inactive" | "closed"
   last_active_at: number
   last_message_at: number
@@ -19,12 +21,26 @@ export type ThreadStore = {
   threads: Record<string, ThreadRecord>
 }
 
+// Back-compat: the `origin` field previously stored legacy shorthand values
+// ("X-b" = terminal-started, "Y-b" = feishu-spawned). Existing threads.json
+// files still carry those values; normalise on read so callers only ever see
+// the new names. Rewrite happens on next save.
+function migrateOrigin(raw: unknown): ThreadOrigin {
+  if (raw === "terminal" || raw === "feishu") return raw
+  if (raw === "X-b") return "terminal"
+  if (raw === "Y-b") return "feishu"
+  return "feishu" // conservative fallback
+}
+
 export function loadThreads(file: string): ThreadStore {
   try {
     const raw = readFileSync(file, "utf8")
     const parsed = JSON.parse(raw) as ThreadStore
     if (!parsed || typeof parsed !== "object" || !parsed.threads) {
       return { version: 1, threads: {} }
+    }
+    for (const rec of Object.values(parsed.threads)) {
+      if (rec) rec.origin = migrateOrigin((rec as any).origin)
     }
     return { version: 1, threads: parsed.threads }
   } catch (err) {
@@ -87,7 +103,7 @@ export function pruneInactive(store: ThreadStore, olderThanMs: number): string[]
   //   - active (live sessions)
   //   - closed (explicit user archive — don't silently erase intent)
   //   - inactive-with-claude_session_uuid (resumable — throwing these away
-  //     would permanently lose the ability to L2-revive that conversation)
+  //     would permanently lose the ability to resume that conversation)
   // Returns pruned thread_ids so the caller can log them.
   const cutoff = Date.now() - olderThanMs
   const pruned: string[] = []
