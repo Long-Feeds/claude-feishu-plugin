@@ -10,7 +10,7 @@ import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq } fr
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, findRecentTerminalThreadForCwd, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
 
@@ -191,12 +191,29 @@ export class Daemon {
 
   private handleRegister(conn: Socket, msg: Extract<ShimReq, { op: "register" }>): void {
     const isFreshRegistration = msg.session_id === null || msg.session_id === undefined
-    const session_id = msg.session_id ?? ulid()
+
+    // Resume-dedup: `claude --resume` respawns the shim as a brand-new process,
+    // which loses the in-memory `sessionId` cache and sends null again. Without
+    // help, daemon treats this as a fresh terminal session and posts a new
+    // announce every restart. Detect the case by cwd: if there's an existing
+    // terminal-origin thread record for this cwd, adopt its session_id instead
+    // of minting a new one. Preserves thread continuity across claude restarts.
+    let session_id = msg.session_id ?? ulid()
+    let reusedFromCwd = false
+    if (isFreshRegistration && !this.pendingFeishuInbound.has(session_id)) {
+      const prior = findRecentTerminalThreadForCwd(this.threads, msg.cwd)
+      if (prior) {
+        session_id = prior.session_id
+        reusedFromCwd = true
+        process.stderr.write(`daemon: terminal register reused session=${session_id} from cwd=${msg.cwd} (thread=${prior.thread_id})\n`)
+      }
+    }
+
     this.state.register({
       session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
     })
     // If the session already has a thread binding, flip status back to active
-    // (e.g. shim reconnecting after daemon restart).
+    // (e.g. shim reconnecting after daemon restart, or resume-dedup match).
     if (findBySessionId(this.threads, session_id)) {
       markActive(this.threads, session_id)
       saveThreads(this.threadsFile, this.threads)
@@ -214,12 +231,13 @@ export class Daemon {
     // root). We skip:
     //   - feishu-spawned sessions (pendingFeishuInbound carries their trigger),
     //   - reconnects (msg.session_id set → isFreshRegistration=false),
-    //   - sessions that already own a thread (resume revival path).
+    //   - sessions that already own a thread (resume revival path),
+    //   - resume-dedup matches (reusedFromCwd — we just adopted an old session).
     const isFeishuSpawn = this.pendingFeishuInbound.has(session_id)
     const alreadyBound = !!findBySessionId(this.threads, session_id)
     const alreadyPending = this.pendingRoots.has(session_id)
     if (
-      isFreshRegistration && !isFeishuSpawn && !alreadyBound && !alreadyPending &&
+      isFreshRegistration && !reusedFromCwd && !isFeishuSpawn && !alreadyBound && !alreadyPending &&
       this.cfg.feishuApi
     ) {
       const hub = loadAccess(this.accessFile).hubChatId

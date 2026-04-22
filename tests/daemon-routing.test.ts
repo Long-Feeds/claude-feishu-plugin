@@ -275,6 +275,59 @@ test("terminal register pushes a bridge hint inbound so Claude knows to post upd
   await daemon.stop()
 })
 
+test("terminal register (fresh session, cwd matches existing terminal thread) reuses session_id and skips announce", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const created: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { created.push(a); return { data: { message_id: "om_new_announce" } } },
+        reply: async () => ({ data: {} }), patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Seed threads.json with a prior inactive terminal session for the cwd
+  // we're about to register in — simulates a prior `claude` that we're now
+  // resuming via `claude --resume`.
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_prior"] = {
+    session_id: "S_PRIOR", chat_id: "oc_hub", root_message_id: "om_prior",
+    cwd: "/proj/resume-me", origin: "terminal", status: "inactive",
+    last_active_at: Date.now() - 30_000, last_message_at: Date.now() - 30_000,
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const replies: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => replies.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({ id: 1, op: "register", session_id: null, pid: 1, cwd: "/proj/resume-me" }))
+  await wait(80)
+
+  // Register response should carry the REUSED session_id, not a new ULID.
+  const registerResp = replies.find((r) => r.id === 1)
+  expect(registerResp?.session_id).toBe("S_PRIOR")
+  // No fresh announce — we reused the existing thread.
+  expect(created.length).toBe(0)
+
+  s.end()
+  await daemon.stop()
+})
+
 test("terminal register (existing session_id, reconnect) does NOT re-announce", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")

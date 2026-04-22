@@ -98,6 +98,26 @@ export function close(store: ThreadStore, thread_id: string): void {
   if (rec) rec.status = "closed"
 }
 
+// Find a terminal-origin thread record bound to `cwd`, newest first, skipping
+// closed threads. Returns undefined if there's no prior binding. Used by
+// handleRegister to reuse an existing session_id when `claude --resume`
+// respawns the shim — keeps the feishu thread continuous across restarts.
+export function findRecentTerminalThreadForCwd(
+  store: ThreadStore,
+  cwd: string,
+): (ThreadRecord & { thread_id: string }) | undefined {
+  let best: (ThreadRecord & { thread_id: string }) | undefined
+  for (const [tid, rec] of Object.entries(store.threads)) {
+    if (rec.origin !== "terminal") continue
+    if (rec.status === "closed") continue
+    if (rec.cwd !== cwd) continue
+    if (!best || rec.last_active_at > best.last_active_at) {
+      best = { ...rec, thread_id: tid }
+    }
+  }
+  return best
+}
+
 export function pruneInactive(store: ThreadStore, olderThanMs: number): string[] {
   // Drops inactive threads older than the cutoff, but keeps:
   //   - active (live sessions)

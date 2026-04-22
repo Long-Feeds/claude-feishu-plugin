@@ -5,6 +5,7 @@ import { tmpdir } from "os"
 import {
   loadThreads, saveThreads, upsertThread, markInactive, markActive,
   close as closeThread, findBySessionId, findByThreadId, pruneInactive,
+  findRecentTerminalThreadForCwd,
 } from "../src/threads"
 
 let file: string
@@ -95,6 +96,39 @@ test("pruneInactive drops old inactive but keeps active, closed, and resumable",
   expect(Object.keys(store.threads).sort()).toEqual([
     "t_active", "t_old_closed", "t_old_resumable", "t_recent_inactive",
   ])
+})
+
+test("findRecentTerminalThreadForCwd returns newest non-closed terminal thread for cwd", () => {
+  const store = loadThreads(file)
+  const now = Date.now()
+  upsertThread(store, "t_old", {
+    session_id: "S_OLD", chat_id: "c", root_message_id: "m1",
+    cwd: "/proj/a", origin: "terminal", status: "inactive",
+    last_active_at: now - 3600_000, last_message_at: now - 3600_000,
+  })
+  upsertThread(store, "t_new", {
+    session_id: "S_NEW", chat_id: "c", root_message_id: "m2",
+    cwd: "/proj/a", origin: "terminal", status: "inactive",
+    last_active_at: now - 60_000, last_message_at: now - 60_000,
+  })
+  upsertThread(store, "t_other_cwd", {
+    session_id: "S_X", chat_id: "c", root_message_id: "m3",
+    cwd: "/proj/b", origin: "terminal", status: "active",
+    last_active_at: now, last_message_at: now,
+  })
+  upsertThread(store, "t_closed_same_cwd", {
+    session_id: "S_CLOSED", chat_id: "c", root_message_id: "m4",
+    cwd: "/proj/a", origin: "terminal", status: "closed",
+    last_active_at: now, last_message_at: now,
+  })
+  upsertThread(store, "t_feishu_spawn_same_cwd", {
+    session_id: "S_F", chat_id: "c", root_message_id: "m5",
+    cwd: "/proj/a", origin: "feishu", status: "inactive",
+    last_active_at: now, last_message_at: now,
+  })
+  const hit = findRecentTerminalThreadForCwd(store, "/proj/a")
+  expect(hit?.thread_id).toBe("t_new")   // newest non-closed terminal match
+  expect(findRecentTerminalThreadForCwd(store, "/proj/z")).toBeUndefined()
 })
 
 test("markActive does NOT reopen closed threads", () => {
