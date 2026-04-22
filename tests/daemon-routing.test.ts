@@ -235,6 +235,45 @@ test("terminal register (fresh session, hub configured) auto-announces and prime
   await daemon.stop()
 })
 
+test("terminal register pushes a bridge hint inbound so Claude knows to post updates", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: { message_id: "om_announce" } }),
+        reply: async () => ({ data: {} }), patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const frames: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => frames.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({ id: 1, op: "register", session_id: null, pid: 1, cwd: "/tmp/xb" }))
+  await wait(80)
+
+  // Expect a push:inbound with feishu-bridge-hint source and the hub chat_id.
+  const hint = frames.find((f) => f?.push === "inbound" && f?.meta?.source === "feishu-bridge-hint")
+  expect(hint).toBeDefined()
+  expect(hint.meta.chat_id).toBe("oc_hub")
+  expect(hint.meta.initial).toBe("true")
+  expect(hint.content.length).toBeGreaterThan(20) // non-empty guidance text
+  s.end()
+  await daemon.stop()
+})
+
 test("terminal register (existing session_id, reconnect) does NOT re-announce", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")

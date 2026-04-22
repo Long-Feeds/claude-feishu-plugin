@@ -273,13 +273,41 @@ export class Daemon {
     if (!this.cfg.feishuApi) return
     this.cfg.feishuApi.sendRoot({
       chat_id: hub,
-      text: `🟢 Claude Code session online — cwd: ${cwd}`,
+      text: `🟢 Claude Code session online\ncwd: ${cwd}`,
       format: "text",
     }).then((res) => {
       // Prime pendingRoots so the session's first MCP reply seeds a thread
       // off this announce rather than creating a second root message.
       this.pendingRoots.set(session_id, { chat_id: hub, root_message_id: res.message_id })
       process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id}\n`)
+      // Push a hint inbound to the shim so Claude knows it's bridged and
+      // which chat_id to post updates to. Without this hint, terminal
+      // Claude has no idea the session should mirror progress to Feishu —
+      // the default MCP instructions are written for the feishu-spawn case
+      // ("sender reads Feishu, not this session"), which is literally wrong
+      // for terminal-origin where the user IS at the terminal. The hint
+      // gets routed through the existing push:inbound → shim → MCP channel
+      // notification path, so Claude processes it exactly like any other
+      // <channel> message and picks up chat_id for subsequent reply calls.
+      const entry = this.state.get(session_id)
+      if (entry) {
+        try {
+          entry.conn.write(frame({
+            push: "inbound",
+            content:
+              "Bridge hint (terminal session): this Claude is bridged to a Feishu group. " +
+              "The operator may or may not be watching the terminal — post concise " +
+              "progress updates via the `reply` tool with the chat_id below so remote " +
+              "observers can follow. You don't need to reply every line — key milestones " +
+              "and final results are enough.",
+            meta: {
+              chat_id: hub,
+              initial: "true",
+              source: "feishu-bridge-hint",
+            },
+          }))
+        } catch {}
+      }
     }).catch((e) => process.stderr.write(`daemon: terminal auto-announce failed: ${e}\n`))
   }
 
