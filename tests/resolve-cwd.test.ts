@@ -48,42 +48,57 @@ test("resolveClaudeCwd falls back to process.cwd when no claude ancestor", () =>
   expect(res).toBe(process.cwd())
 })
 
-test("findClaudeSessionUuid extracts uuid from claude's open jsonl fd", () => {
+test("findClaudeSessionUuid reads sessionId from ~/.claude/sessions/<pid>.json", () => {
   const fs = fakeFs({
     100: { ppid: 99, comm: "bun", cwd: "/plugin" },
     99:  { ppid: 98, comm: "bun", cwd: "/plugin" },
-    98:  {
-      ppid: 97, comm: "claude", cwd: "/home/me/proj",
-      fds: [
-        "/dev/null",
-        "/home/me/.claude/projects/-home-me-proj/3d40b615-a368-4cbf-8c03-d42f166883e9.jsonl",
-        "/home/me/.claude/history.jsonl",  // not a session jsonl
-      ],
-    },
+    98:  { ppid: 97, comm: "claude", cwd: "/home/me/proj" },
     97:  { ppid: 1, comm: "bash", cwd: "/" },
   })
-  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBe("3d40b615-a368-4cbf-8c03-d42f166883e9")
+  const readSessionFile = (pid: number) => {
+    if (pid === 98) return JSON.stringify({
+      pid: 98, sessionId: "3d40b615-a368-4cbf-8c03-d42f166883e9",
+      cwd: "/home/me/proj", version: "2.1.117",
+    })
+    return null
+  }
+  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBe("3d40b615-a368-4cbf-8c03-d42f166883e9")
 })
 
-test("findClaudeSessionUuid returns null when claude hasn't opened a session jsonl yet", () => {
+test("findClaudeSessionUuid returns null when session file missing", () => {
   const fs = fakeFs({
     100: { ppid: 99, comm: "bun", cwd: "/plugin" },
-    99:  { ppid: 98, comm: "claude", cwd: "/home/me/proj", fds: ["/dev/null"] },
+    99:  { ppid: 98, comm: "claude", cwd: "/home/me/proj" },
     98:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  const readSessionFile = (_pid: number) => null
+  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+})
+
+test("findClaudeSessionUuid returns null on malformed session file", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "claude", cwd: "/proj" },
+    99:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  const readSessionFile = (_pid: number) => "not-json"
+  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+})
+
+test("findClaudeSessionUuid rejects a sessionId that doesn't look like a UUID", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "claude", cwd: "/proj" },
+    99:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  const readSessionFile = (_pid: number) => JSON.stringify({ sessionId: "too-short" })
+  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+})
+
+test("findClaudeSessionUuid returns null when no claude ancestor", () => {
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
+    99:  { ppid: 1, comm: "systemd", cwd: "/" },
   })
   expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBeNull()
-})
-
-test("findClaudeSessionUuid handles a deleted jsonl fd marker", () => {
-  const fs = fakeFs({
-    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
-    99:  {
-      ppid: 98, comm: "claude", cwd: "/home/me/proj",
-      fds: ["/home/me/.claude/projects/-proj/abcdef123456-7890-1234-5678-901234567890.jsonl (deleted)"],
-    },
-    98:  { ppid: 1, comm: "bash", cwd: "/" },
-  })
-  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBe("abcdef123456-7890-1234-5678-901234567890")
 })
 
 test("resolveClaudeCwd respects maxDepth", () => {

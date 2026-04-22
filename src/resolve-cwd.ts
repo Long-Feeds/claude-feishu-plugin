@@ -89,24 +89,44 @@ export function findClaudePid(opts: ResolveOpts = {}): number | null {
   return null
 }
 
-// Claude Code writes its session log to
-//   ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl
-// and keeps the file open for the life of the session. We inspect the claude
-// process's open-fd list for any `.jsonl` under `~/.claude/projects/` and
-// return the UUID from the filename. This gives us a stable session key that
-// survives `claude --resume` (same UUID = same jsonl = same thread binding),
-// unlike our own in-memory `sessionId` cache which is lost on process restart.
-// Returns null when claude hasn't opened its jsonl yet (fresh `claude` before
-// the first turn writes an event).
-export function findClaudeSessionUuid(opts: ResolveOpts = {}): string | null {
-  const fs = opts.fs ?? realProcFs
-  if (!fs.listFds) return null
+// Claude Code writes per-process session metadata to
+//   ~/.claude/sessions/<claude_pid>.json
+// on startup, containing {"pid":..., "sessionId":"<uuid>", "cwd":"...", ...}.
+// The `sessionId` is stable across `claude --resume` (same conversation →
+// same UUID), which is exactly the key we want for thread routing.
+// Reading this file is cheap and reliable, unlike scanning /proc/<pid>/fd for
+// open jsonl handles (Claude doesn't keep the jsonl open between writes, so
+// fd inspection almost always misses it).
+//
+// Returns null when we can't find a claude ancestor, can't read the session
+// file, or the file hasn't been written yet (very early startup — Claude Code
+// usually writes it before spawning MCP children, but we tolerate the race).
+export type SessionFileReader = (pid: number) => string | null
+export function findClaudeSessionUuid(
+  opts: ResolveOpts & { readSessionFile?: SessionFileReader } = {},
+): string | null {
   const pid = findClaudePid(opts)
   if (pid === null) return null
-  for (const path of fs.listFds(pid)) {
-    // Match absolute paths like /home/<user>/.claude/projects/<slug>/<uuid>.jsonl
-    const m = /\/\.claude\/projects\/[^/]+\/([0-9a-f-]{20,})\.jsonl(\s*\(deleted\))?$/i.exec(path)
-    if (m && m[1]) return m[1]
-  }
+  const readFn = opts.readSessionFile ?? defaultReadSessionFile
+  const raw = readFn(pid)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as { sessionId?: string }
+    if (parsed.sessionId && /^[0-9a-f-]{20,}$/i.test(parsed.sessionId)) {
+      return parsed.sessionId
+    }
+  } catch { /* fallthrough */ }
   return null
+}
+
+function defaultReadSessionFile(pid: number): string | null {
+  // Use the *claude user's* home, not whatever $HOME the shim inherits. In
+  // the normal install they're the same, but the tests inject a different
+  // home via opts.readSessionFile anyway, so this stays simple.
+  const home = process.env.HOME ?? ""
+  try {
+    return require("fs").readFileSync(`${home}/.claude/sessions/${pid}.json`, "utf8")
+  } catch {
+    return null
+  }
 }
