@@ -63,8 +63,26 @@ at() { echo "<at user_id=\"$BOT_OPEN_ID\">bot</at>"; }
 | R2 | 代码里除了兼容层没残留 `X-b` / `Y-b` | `grep -rnE '\\bX-b\\b\|\\bY-b\\b' src/ tests/ \| grep -v migrate` | 空 |
 | R3 | 没 zombie server.ts 占 WS | `pgrep -fa "server.ts"` | 空 |
 
+## 场景 C — Permission prompt 同步到飞书（MCP experimental channel）
+
+当 Claude 要执行需要用户确认的操作（curl、外部命令、写 cwd 外文件 等），应把 🔐 Permission 请求 post 到飞书 thread，你在群里回 `y <code>` / `n <code>` 决定。
+
+**前提**：必须加 `--dangerously-load-development-channels feishu` 启动 claude。否则 Claude Code 忽略我们声明的 `experimental.claude/channel/permission` 能力，permission prompt 只在本地终端出现。
+
+| # | 操作 | 预期 |
+|---|---|---|
+| C1 | 新终端里 `cd <project> && claude --dangerously-load-development-channels feishu` | 交互式 claude 启动，群里冒一条 `🟢 session online` root |
+| C2 | 在 claude 里输入：`run 'curl -sI https://example.com'`（或任何不在你 settings.allow 里的工具用法） | Claude 尝试调 Bash → 触发 permission prompt |
+| C3 | 飞书群对应 thread 里出现 `🔐 Permission: Bash ... Reply with: y <code> ...` | daemon log: `daemon: permission relay` |
+| C4 | 群里回 `y <5-char-code>` | Claude 的 prompt 自动放行，命令执行；daemon log: `permission_reply` push 送回 shim |
+| C5 | 回 `n <code>` 走拒绝分支 | Claude 收到 deny，终止该工具 |
+
+**--print 模式不适用**：`claude --print` 不等待异步 permission 响应，直接 auto-deny。要测 permission 同步必须交互式。
+
+---
+
 ## 通过定义
 
-**本轮开发完成 = Pre-flight 全过 + 场景 A 全过 + 场景 B 全过**。
+**本轮开发完成 = Pre-flight 全过 + 场景 A 全过 + 场景 B 全过 + 场景 C 手动验一次**。
 
 回归守门建议跑一次但不强制。R1 / R2 特别容易在重命名之后失败。

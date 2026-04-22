@@ -17,23 +17,11 @@
 // down or the socket is missing, we log to stderr and exit 0.
 
 import { readFileSync } from "fs"
-import { connect } from "net"
-import { homedir } from "os"
-import { join } from "path"
+import { debugLog, sendFrame } from "./lib"
 
 async function main(): Promise<void> {
-  const debugLog = (m: string): void => {
-    // Append to a local debug log since Stop-hook stderr goes to Claude's
-    // process (invisible to us). Tail `${stateDir}/hook-debug.log` to trace.
-    try {
-      require("fs").appendFileSync(
-        join(STATE_DIR_DEFAULT, "hook-debug.log"),
-        `[${new Date().toISOString()}] ${m}\n`,
-      )
-    } catch {}
-  }
   const raw = readFileSync(0, "utf8")  // stdin
-  debugLog(`hook fired, stdin=${raw.length} bytes`)
+  debugLog("stop", `hook fired, stdin=${raw.length} bytes`)
   let payload: {
     session_id?: string
     transcript_path?: string
@@ -41,12 +29,12 @@ async function main(): Promise<void> {
     hook_event_name?: string
   }
   try { payload = JSON.parse(raw) } catch {
-    debugLog(`bad hook stdin payload`)
+    debugLog("stop", `bad hook stdin payload`)
     process.exit(0)
   }
 
   if (!payload.transcript_path || !payload.cwd) {
-    debugLog(`missing transcript_path/cwd`)
+    debugLog("stop", `missing transcript_path/cwd`)
     process.exit(0)
   }
 
@@ -56,34 +44,31 @@ async function main(): Promise<void> {
   // the transcript to grow past its current event count before extracting,
   // with a short ceiling so we never block Claude's exit for long.
   const text = await waitForFreshAssistantText(payload.transcript_path, 2000)
-  debugLog(`session=${payload.session_id ?? "?"} cwd=${payload.cwd} text_len=${text.length}`)
+  debugLog("stop", `session=${payload.session_id ?? "?"} cwd=${payload.cwd} text_len=${text.length}`)
   if (!text) {
-    debugLog(`no assistant text to mirror`)
+    debugLog("stop", `no assistant text to mirror`)
     process.exit(0)
   }
 
   // Skip tiny / trivia turns so the feishu thread stays readable. Tune if
   // this threshold trims something useful.
   if (text.length < 8) {
-    debugLog(`text too short (${text.length}), skipping`)
+    debugLog("stop", `text too short (${text.length}), skipping`)
     return
   }
 
-  const sock = process.env.FEISHU_DAEMON_SOCKET ?? join(STATE_DIR_DEFAULT, "daemon.sock")
-
   try {
-    await sendHookPost(sock, {
+    await sendFrame({
+      op: "hook_post",
       claude_session_uuid: payload.session_id ?? "",
       cwd: payload.cwd,
       text,
     })
-    debugLog(`posted to daemon ok`)
+    debugLog("stop", `posted to daemon ok`)
   } catch (err) {
-    debugLog(`daemon post failed: ${err}`)
+    debugLog("stop", `daemon post failed: ${err}`)
   }
 }
-
-const STATE_DIR_DEFAULT = process.env.FEISHU_STATE_DIR ?? join(homedir(), ".claude", "channels", "feishu")
 
 // Poll the transcript for up to maxMs until it holds at least one more
 // assistant-text event than it did at call time, then return the latest
@@ -165,25 +150,6 @@ export function extractLastAssistantText(path: string): string {
   return ""
 }
 
-function sendHookPost(
-  socketPath: string,
-  body: { claude_session_uuid: string; cwd: string; text: string },
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const s = connect(socketPath)
-    let settled = false
-    const done = () => { if (settled) return; settled = true; try { s.end() } catch {}; resolve() }
-    s.on("connect", () => {
-      const frame = JSON.stringify({ id: 1, op: "hook_post", ...body }) + "\n"
-      s.write(frame)
-    })
-    // Resolve on any bytes back from daemon (the ack) — we don't parse it.
-    s.on("data", () => done())
-    s.on("error", reject)
-    // Belt-and-suspenders timeout so hook doesn't stall Claude's exit.
-    setTimeout(done, 2000)
-  })
-}
 
 if (import.meta.main) {
   await main()
