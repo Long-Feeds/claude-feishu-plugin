@@ -89,44 +89,71 @@ export function findClaudePid(opts: ResolveOpts = {}): number | null {
   return null
 }
 
-// Claude Code writes per-process session metadata to
-//   ~/.claude/sessions/<claude_pid>.json
-// on startup, containing {"pid":..., "sessionId":"<uuid>", "cwd":"...", ...}.
-// The `sessionId` is stable across `claude --resume` (same conversation →
-// same UUID), which is exactly the key we want for thread routing.
-// Reading this file is cheap and reliable, unlike scanning /proc/<pid>/fd for
-// open jsonl handles (Claude doesn't keep the jsonl open between writes, so
-// fd inspection almost always misses it).
+// Claude Code's resume-stable identity is the **jsonl filename** in
+//   ~/.claude/projects/<cwd-slug>/<session-uuid>.jsonl
+// where cwd-slug is the cwd with `/` replaced by `-`. `claude --continue`
+// and `claude --resume <id>` both extend an existing jsonl; fresh `claude`
+// creates a new one. The UUID in the filename is stable across restarts
+// (same conversation → same file). The per-process file at
+// `~/.claude/sessions/<pid>.json` looks plausible but actually carries a
+// FRESH UUID every invocation (empirically verified: claude --continue
+// rewrites this file with a new sessionId even though the jsonl is reused).
 //
-// Returns null when we can't find a claude ancestor, can't read the session
-// file, or the file hasn't been written yet (very early startup — Claude Code
-// usually writes it before spawning MCP children, but we tolerate the race).
-export type SessionFileReader = (pid: number) => string | null
-export function findClaudeSessionUuid(
-  opts: ResolveOpts & { readSessionFile?: SessionFileReader } = {},
-): string | null {
-  const pid = findClaudePid(opts)
-  if (pid === null) return null
-  const readFn = opts.readSessionFile ?? defaultReadSessionFile
-  const raw = readFn(pid)
-  if (!raw) return null
+// Strategy: compute the cwd-slug from the claude ancestor's cwd, list
+// *.jsonl in the project dir, and pick the one with the newest mtime IF
+// that mtime is recent enough to be plausibly the active session (otherwise
+// we'd latch onto a stale previous session when launched as a brand-new
+// claude). "Recent enough" = within `freshnessMs` of now (default 10s) —
+// Claude writes the first event to its jsonl within a second or two of
+// spawning the MCP child.
+//
+// Returns null for fresh `claude` (newest jsonl too old) or when we can't
+// locate the project dir.
+
+import { readdirSync, statSync } from "fs"
+
+export type JsonlLister = (projectDir: string) => { name: string; mtimeMs: number }[]
+
+function defaultListProjectJsonls(projectDir: string): { name: string; mtimeMs: number }[] {
   try {
-    const parsed = JSON.parse(raw) as { sessionId?: string }
-    if (parsed.sessionId && /^[0-9a-f-]{20,}$/i.test(parsed.sessionId)) {
-      return parsed.sessionId
-    }
-  } catch { /* fallthrough */ }
-  return null
+    return readdirSync(projectDir)
+      .filter((n) => n.endsWith(".jsonl"))
+      .map((n) => {
+        try { return { name: n, mtimeMs: statSync(`${projectDir}/${n}`).mtimeMs } } catch { return null }
+      })
+      .filter((x): x is { name: string; mtimeMs: number } => x !== null)
+  } catch { return [] }
 }
 
-function defaultReadSessionFile(pid: number): string | null {
-  // Use the *claude user's* home, not whatever $HOME the shim inherits. In
-  // the normal install they're the same, but the tests inject a different
-  // home via opts.readSessionFile anyway, so this stays simple.
-  const home = process.env.HOME ?? ""
-  try {
-    return require("fs").readFileSync(`${home}/.claude/sessions/${pid}.json`, "utf8")
-  } catch {
-    return null
-  }
+// Claude's project-dir slug is the absolute cwd path with `/` → `-`, with
+// a leading `-` (because the cwd starts with `/`).
+export function cwdToProjectSlug(cwd: string): string {
+  return cwd.replace(/\//g, "-")
+}
+
+export type SessionUuidOpts = ResolveOpts & {
+  claudeHome?: string          // default: $HOME/.claude
+  now?: number                 // injected for tests
+  freshnessMs?: number         // default 10_000
+  listJsonls?: JsonlLister
+}
+
+export function findClaudeSessionUuid(opts: SessionUuidOpts = {}): string | null {
+  const pid = findClaudePid(opts)
+  if (pid === null) return null
+  const fs = opts.fs ?? realProcFs
+  const cwd = fs.readCwd(pid)
+  if (!cwd) return null
+  const home = opts.claudeHome ?? `${process.env.HOME ?? ""}/.claude`
+  const projectDir = `${home}/projects/${cwdToProjectSlug(cwd)}`
+  const list = (opts.listJsonls ?? defaultListProjectJsonls)(projectDir)
+  if (list.length === 0) return null
+  const newest = list.reduce((a, b) => (a.mtimeMs >= b.mtimeMs ? a : b))
+  const now = opts.now ?? Date.now()
+  const freshnessMs = opts.freshnessMs ?? 10_000
+  if (now - newest.mtimeMs > freshnessMs) return null
+  // Filename is <uuid>.jsonl — strip the extension.
+  const base = newest.name.replace(/\.jsonl$/, "")
+  if (!/^[0-9a-f-]{20,}$/i.test(base)) return null
+  return base
 }

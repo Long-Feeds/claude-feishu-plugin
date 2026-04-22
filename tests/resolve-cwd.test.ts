@@ -48,49 +48,52 @@ test("resolveClaudeCwd falls back to process.cwd when no claude ancestor", () =>
   expect(res).toBe(process.cwd())
 })
 
-test("findClaudeSessionUuid reads sessionId from ~/.claude/sessions/<pid>.json", () => {
+import { cwdToProjectSlug } from "../src/resolve-cwd"
+
+test("cwdToProjectSlug matches claude's <cwd>→<slug> convention", () => {
+  expect(cwdToProjectSlug("/home/me/proj")).toBe("-home-me-proj")
+  expect(cwdToProjectSlug("/tmp/e2e-test-abc")).toBe("-tmp-e2e-test-abc")
+})
+
+test("findClaudeSessionUuid returns the UUID of the newest jsonl in project dir (recently touched)", () => {
+  const now = 1_700_000_000_000
   const fs = fakeFs({
     100: { ppid: 99, comm: "bun", cwd: "/plugin" },
     99:  { ppid: 98, comm: "bun", cwd: "/plugin" },
     98:  { ppid: 97, comm: "claude", cwd: "/home/me/proj" },
     97:  { ppid: 1, comm: "bash", cwd: "/" },
   })
-  const readSessionFile = (pid: number) => {
-    if (pid === 98) return JSON.stringify({
-      pid: 98, sessionId: "3d40b615-a368-4cbf-8c03-d42f166883e9",
-      cwd: "/home/me/proj", version: "2.1.117",
-    })
-    return null
+  const listJsonls = (dir: string) => {
+    expect(dir).toBe("/fakehome/projects/-home-me-proj")
+    return [
+      { name: "11111111-1111-4111-a111-111111111111.jsonl", mtimeMs: now - 3_000_000 }, // hours old
+      { name: "22222222-2222-4222-a222-222222222222.jsonl", mtimeMs: now - 500 },       // fresh
+    ]
   }
-  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBe("3d40b615-a368-4cbf-8c03-d42f166883e9")
-})
-
-test("findClaudeSessionUuid returns null when session file missing", () => {
-  const fs = fakeFs({
-    100: { ppid: 99, comm: "bun", cwd: "/plugin" },
-    99:  { ppid: 98, comm: "claude", cwd: "/home/me/proj" },
-    98:  { ppid: 1, comm: "bash", cwd: "/" },
+  const uuid = findClaudeSessionUuid({
+    fs, startPid: 100, claudeHome: "/fakehome", listJsonls, now,
   })
-  const readSessionFile = (_pid: number) => null
-  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+  expect(uuid).toBe("22222222-2222-4222-a222-222222222222")
 })
 
-test("findClaudeSessionUuid returns null on malformed session file", () => {
+test("findClaudeSessionUuid returns null when newest jsonl is stale (fresh claude, no writes yet)", () => {
+  const now = 1_700_000_000_000
   const fs = fakeFs({
-    100: { ppid: 99, comm: "claude", cwd: "/proj" },
+    100: { ppid: 99, comm: "claude", cwd: "/home/me/proj" },
     99:  { ppid: 1, comm: "bash", cwd: "/" },
   })
-  const readSessionFile = (_pid: number) => "not-json"
-  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+  const listJsonls = () => [
+    { name: "11111111-1111-4111-a111-111111111111.jsonl", mtimeMs: now - 60_000 },
+  ]
+  expect(findClaudeSessionUuid({ fs, startPid: 100, claudeHome: "/h", listJsonls, now })).toBeNull()
 })
 
-test("findClaudeSessionUuid rejects a sessionId that doesn't look like a UUID", () => {
+test("findClaudeSessionUuid returns null when project dir is empty", () => {
   const fs = fakeFs({
-    100: { ppid: 99, comm: "claude", cwd: "/proj" },
+    100: { ppid: 99, comm: "claude", cwd: "/home/me/proj" },
     99:  { ppid: 1, comm: "bash", cwd: "/" },
   })
-  const readSessionFile = (_pid: number) => JSON.stringify({ sessionId: "too-short" })
-  expect(findClaudeSessionUuid({ fs, startPid: 100, readSessionFile })).toBeNull()
+  expect(findClaudeSessionUuid({ fs, startPid: 100, claudeHome: "/h", listJsonls: () => [] })).toBeNull()
 })
 
 test("findClaudeSessionUuid returns null when no claude ancestor", () => {
@@ -98,7 +101,17 @@ test("findClaudeSessionUuid returns null when no claude ancestor", () => {
     100: { ppid: 99, comm: "bun", cwd: "/plugin" },
     99:  { ppid: 1, comm: "systemd", cwd: "/" },
   })
-  expect(findClaudeSessionUuid({ fs, startPid: 100 })).toBeNull()
+  expect(findClaudeSessionUuid({ fs, startPid: 100, listJsonls: () => [] })).toBeNull()
+})
+
+test("findClaudeSessionUuid rejects a filename that isn't a UUID", () => {
+  const now = 1_700_000_000_000
+  const fs = fakeFs({
+    100: { ppid: 99, comm: "claude", cwd: "/home/me/proj" },
+    99:  { ppid: 1, comm: "bash", cwd: "/" },
+  })
+  const listJsonls = () => [{ name: "not-a-uuid.jsonl", mtimeMs: now }]
+  expect(findClaudeSessionUuid({ fs, startPid: 100, claudeHome: "/h", listJsonls, now })).toBeNull()
 })
 
 test("resolveClaudeCwd respects maxDepth", () => {

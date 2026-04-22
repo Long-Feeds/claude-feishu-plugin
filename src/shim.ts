@@ -302,10 +302,17 @@ async function registerSession(): Promise<void> {
   // cares about ("cwd" in the hub announce).
   const reportedCwd = resolveClaudeCwd()
   // Prefer Claude Code's own session UUID — it's stable across
-  // `claude --resume`. Claude writes {pid, sessionId, cwd, ...} to
-  // ~/.claude/sessions/<claude_pid>.json at startup; we just read it.
+  // `claude --continue` / `claude --resume` because those reuse the same
+  // `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`. At startup, Claude writes
+  // the first event (MCP initialize) to that file within ~1s of spawning
+  // the shim, so we poll briefly for the freshly-touched jsonl.
   if (!sessionId && !process.env.FEISHU_SHIM_SKIP_UUID_PROBE) {
-    sessionId = findClaudeSessionUuid()
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      const uuid = findClaudeSessionUuid()
+      if (uuid) { sessionId = uuid; break }
+      await new Promise((r) => setTimeout(r, 100))
+    }
     if (sessionId) {
       process.stderr.write(`shim: resolved claude session uuid=${sessionId}\n`)
     }
