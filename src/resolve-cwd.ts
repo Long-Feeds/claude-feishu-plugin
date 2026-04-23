@@ -94,21 +94,26 @@ export function findClaudePid(opts: ResolveOpts = {}): number | null {
 // where cwd-slug is the cwd with `/` replaced by `-`. `claude --continue`
 // and `claude --resume <id>` both extend an existing jsonl; fresh `claude`
 // creates a new one. The UUID in the filename is stable across restarts
-// (same conversation → same file). The per-process file at
-// `~/.claude/sessions/<pid>.json` looks plausible but actually carries a
-// FRESH UUID every invocation (empirically verified: claude --continue
-// rewrites this file with a new sessionId even though the jsonl is reused).
+// (same conversation → same file).
 //
-// Strategy: compute the cwd-slug from the claude ancestor's cwd, list
-// *.jsonl in the project dir, and pick the one with the newest mtime IF
-// that mtime is recent enough to be plausibly the active session (otherwise
-// we'd latch onto a stale previous session when launched as a brand-new
-// claude). "Recent enough" = within `freshnessMs` of now (default 10s) —
-// Claude writes the first event to its jsonl within a second or two of
-// spawning the MCP child.
+// Each running claude also writes `~/.claude/sessions/<pid>.json` containing
+// a `sessionId` field. For a FRESH spawn, that sessionId matches the jsonl
+// filename (1:1). For a `claude --continue` / `--resume`, the pid-json gets
+// a fresh throwaway UUID while the jsonl keeps its stable name — so the two
+// can differ. Strategy therefore has two paths:
 //
-// Returns null for fresh `claude` (newest jsonl too old) or when we can't
-// locate the project dir.
+//   (a) Fast path: read my claude parent's pid-json. If `<uuid>.jsonl` with
+//       that uuid exists in the project dir → return it. This is a FRESH
+//       spawn and it disambiguates the concurrent-spawn race (two claudes
+//       in the same cwd must not pick each other's jsonl just because it's
+//       "newest within 10s").
+//   (b) Slow path (resume): pid-json's uuid doesn't have a jsonl, or
+//       pid-json isn't written yet. Fall back to "newest-mtime within
+//       freshnessMs" — but REMOVE jsonls whose basename is claimed by
+//       another live claude's pid-json. That eliminates the race for the
+//       resume case too (we'll never pick a sibling claude's jsonl).
+//
+// Returns null when nothing plausible is found (caller retries).
 
 import { readdirSync, statSync } from "fs"
 
@@ -125,6 +130,42 @@ function defaultListProjectJsonls(projectDir: string): { name: string; mtimeMs: 
   } catch { return [] }
 }
 
+export type PidSessionReader = (pid: number, claudeHome: string) => string | null
+
+function defaultReadPidSessionId(pid: number, claudeHome: string): string | null {
+  try {
+    const raw = readFileSync(`${claudeHome}/sessions/${pid}.json`, "utf8")
+    const parsed = JSON.parse(raw) as { sessionId?: unknown }
+    return typeof parsed.sessionId === "string" ? parsed.sessionId : null
+  } catch { return null }
+}
+
+export type ClaimedIdsLister = (claudeHome: string, excludePid: number, fs: ProcFs) => Set<string>
+
+function defaultListClaimedSessionIds(
+  claudeHome: string,
+  excludePid: number,
+  fs: ProcFs,
+): Set<string> {
+  const out = new Set<string>()
+  try {
+    for (const name of readdirSync(`${claudeHome}/sessions`)) {
+      const m = name.match(/^(\d+)\.json$/)
+      if (!m) continue
+      const pid = Number(m[1])
+      if (!Number.isFinite(pid) || pid === excludePid) continue
+      // Skip stale pid-jsons from dead claudes — otherwise we'd filter jsonls
+      // whose owner exited ages ago, and the resume-path fallback would
+      // come back empty. ProcFs.readComm is the liveness check (real fs
+      // backs it with /proc/<pid>/comm; tests inject their own).
+      if (fs.readComm(pid) === null) continue
+      const sid = defaultReadPidSessionId(pid, claudeHome)
+      if (sid) out.add(sid)
+    }
+  } catch { /* sessions dir missing — fine */ }
+  return out
+}
+
 // Claude Code's project-dir slug: replace `/` AND `.` with `-`. The `.`
 // transform tripped us up in deployment — `/data00/home/xiaolong.835/…`
 // becomes `-data00-home-xiaolong-835-…` (not `-data00-home-xiaolong.835-…`),
@@ -136,11 +177,15 @@ export function cwdToProjectSlug(cwd: string): string {
   return cwd.replace(/[./]/g, "-")
 }
 
+const UUID_RE = /^[0-9a-f-]{20,}$/i
+
 export type SessionUuidOpts = ResolveOpts & {
   claudeHome?: string          // default: $HOME/.claude
   now?: number                 // injected for tests
   freshnessMs?: number         // default 10_000
   listJsonls?: JsonlLister
+  readPidSessionId?: PidSessionReader
+  listClaimedSessionIds?: ClaimedIdsLister
 }
 
 export function findClaudeSessionUuid(opts: SessionUuidOpts = {}): string | null {
@@ -152,15 +197,37 @@ export function findClaudeSessionUuid(opts: SessionUuidOpts = {}): string | null
   const home = opts.claudeHome ?? `${process.env.HOME ?? ""}/.claude`
   const projectDir = `${home}/projects/${cwdToProjectSlug(cwd)}`
   const list = (opts.listJsonls ?? defaultListProjectJsonls)(projectDir)
-  if (list.length === 0) return null
-  const newest = list.reduce((a, b) => (a.mtimeMs >= b.mtimeMs ? a : b))
   const now = opts.now ?? Date.now()
   const freshnessMs = opts.freshnessMs ?? 10_000
-  if (now - newest.mtimeMs > freshnessMs) return null
-  // Filename is <uuid>.jsonl — strip the extension.
-  const base = newest.name.replace(/\.jsonl$/, "")
-  if (!/^[0-9a-f-]{20,}$/i.test(base)) return null
-  return base
+  const readPidSessionId = opts.readPidSessionId ?? defaultReadPidSessionId
+
+  // Fast path: pid-json's sessionId pinpoints exactly which jsonl belongs
+  // to MY claude. Doesn't care about other concurrent claudes writing
+  // their own jsonls. If pid-json hasn't been written yet (first ~100ms
+  // of claude startup), this returns null and we fall through.
+  const myCandidate = readPidSessionId(pid, home)
+  if (myCandidate && UUID_RE.test(myCandidate)) {
+    const hit = list.find((j) => j.name === `${myCandidate}.jsonl`)
+    if (hit && now - hit.mtimeMs <= freshnessMs) return myCandidate
+  }
+
+  // Resume path: pid-json's sessionId is a fresh throwaway; the jsonl
+  // actually being written has a DIFFERENT name. Pick the newest jsonl,
+  // but exclude ones claimed by other live claudes so a concurrent
+  // sibling's jsonl can't slip in.
+  if (list.length === 0) return null
+  const listClaimed = opts.listClaimedSessionIds ?? defaultListClaimedSessionIds
+  const claimed = listClaimed(home, pid, fs)
+  const candidates = list.filter((j) => {
+    const base = j.name.replace(/\.jsonl$/, "")
+    if (!UUID_RE.test(base)) return false
+    if (now - j.mtimeMs > freshnessMs) return false
+    if (claimed.has(base)) return false
+    return true
+  })
+  if (candidates.length === 0) return null
+  const newest = candidates.reduce((a, b) => (a.mtimeMs >= b.mtimeMs ? a : b))
+  return newest.name.replace(/\.jsonl$/, "")
 }
 
 // Daemon-side helper: spawn a claude in `cwd`, then poll the project jsonl

@@ -40,6 +40,25 @@ test("findBySessionId reverse lookup", () => {
   expect(found?.thread_id).toBe("t1")
 })
 
+test("findBySessionId prefers the most-recently-active binding when duplicates exist", () => {
+  // Regression against the UUID-probe race that once produced multiple
+  // thread records under the same session_id. First-inserted used to win
+  // (routing replies to a stale thread); now newest-active wins so the
+  // currently-active topic gets the reply.
+  const store = loadThreads(file)
+  upsertThread(store, "t_old", {
+    session_id: "S1", chat_id: "c1", root_message_id: "m_old",
+    cwd: "/w", origin: "feishu", status: "active",
+    last_active_at: 100, last_message_at: 100,
+  })
+  upsertThread(store, "t_new", {
+    session_id: "S1", chat_id: "c1", root_message_id: "m_new",
+    cwd: "/w", origin: "feishu", status: "active",
+    last_active_at: 500, last_message_at: 500,
+  })
+  expect(findBySessionId(store, "S1")?.thread_id).toBe("t_new")
+})
+
 test("markInactive then markActive cycle", () => {
   const store = loadThreads(file)
   upsertThread(store, "t1", {
