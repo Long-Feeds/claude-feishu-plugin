@@ -1,5 +1,5 @@
 import { createServer, Server, Socket } from "net"
-import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "fs"
+import { chmodSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs"
 import { join } from "path"
 import * as lark from "@larksuiteoapi/node-sdk"
 import { DaemonState } from "./daemon-state"
@@ -458,12 +458,25 @@ export class Daemon {
 
   private announceDeferredTerminalSessions(hub: string): void {
     if (this.deferredTerminalAnnounce.size === 0) return
-    // Hub just became known. We can't fabricate a user-prompt title for these
-    // sessions (their first prompt may already have been submitted while hub
-    // was unset), so fall back to the pre-prompt announce and let operators
-    // see the generic root. The title will stay generic for these only.
-    for (const [session_id] of this.deferredTerminalAnnounce) {
+    // Hub just became known. Mirror the hub-present branch of handleRegister:
+    // bridge-hint + a root announce, seeding pendingRoots so subsequent
+    // Stop-hook mirrors from this session have a thread to attach to. Without
+    // the announce, those mirrors hit `no thread or pendingRoot match` and
+    // get dropped until Claude explicitly calls reply — which breaks the
+    // automatic mirroring flow for any session that registered before hub
+    // was set. Prefer a buffered first prompt as the title; otherwise fall
+    // back to the generic announce.
+    for (const [session_id, { cwd }] of this.deferredTerminalAnnounce) {
       this.scheduleBridgeHint(session_id, hub)
+      const buffered = this.pendingUserPrompts.get(cwd)
+      const titleSource = buffered && Date.now() - buffered.ts < PENDING_PROMPT_TTL_MS
+        ? buffered.prompt
+        : undefined
+      if (titleSource !== undefined) this.pendingUserPrompts.delete(cwd)
+      const title = titleSource !== undefined
+        ? this.titleFromPrompt(titleSource)
+        : "Claude Code session online"
+      this.sendTerminalAnnounce(session_id, hub, cwd, title)
     }
     this.deferredTerminalAnnounce.clear()
   }
@@ -504,12 +517,16 @@ export class Daemon {
       // feishu-spawn owns the root). Subsequent prompts are no-ops.
       return
     }
-    // UUID isn't bound. If the shim registered under a different id (ULID
-    // fallback because jsonl probe timed out), we fall back to matching the
-    // session by cwd via the state registry — same cwd + same-ish timing
-    // window. Pick the most-recently-registered terminal session in this cwd
-    // that has no thread/pendingRoot/feishuRoot yet.
-    const target = this.state.findNewestTerminalForCwd(cwd)
+    // UUID isn't bound. First try a direct UUID → SessionEntry lookup: the
+    // shim usually registers under the same claude_session_uuid the hook
+    // ships, and when two panes share a cwd this is the only way to route
+    // the prompt to the right session (cwd-newest would bind the title to
+    // whichever pane registered last). Only fall back to cwd-newest when
+    // the shim registered under a different id — happens when the jsonl
+    // UUID probe timed out and it had to use a ULID fallback.
+    const target =
+      (uuid ? this.state.get(uuid) : undefined)
+      ?? this.state.findNewestTerminalForCwd(cwd)
     if (!target) {
       // No shim registered yet for this cwd — park the prompt so the next
       // handleRegister (probably seconds away; shim is probing UUID) can
@@ -561,6 +578,7 @@ export class Daemon {
     // of Claude's actual reply text right after Claude's reply tool call.
     this.turnReplyCounts.set(entry.session_id, (this.turnReplyCounts.get(entry.session_id) ?? 0) + 1)
 
+    const files = msg.files ?? []
     try {
       if (!bound && !pending && feishuRoot) {
         // First reply for feishu-spawned: seed thread rooted on the user's triggering message.
@@ -580,6 +598,7 @@ export class Daemon {
         })
         saveThreads(this.threadsFile, this.threads)
         this.pendingFeishuRoots.delete(entry.session_id)
+        await this.sendAttachments(feishuRoot.chat_id, files)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: res.thread_id }))
         return
       }
@@ -595,6 +614,7 @@ export class Daemon {
         const pr = { chat_id: chat_home, root_message_id: res.message_id }
         this.pendingRoots.set(entry.session_id, pr)
         this.persistPendingRoot(entry.session_id, pr)
+        await this.sendAttachments(chat_home, files)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: null }))
         return
       }
@@ -617,6 +637,7 @@ export class Daemon {
         this.pendingRoots.delete(entry.session_id)
         this.clearPendingRoot(entry.session_id)   // also removes from disk
         saveThreads(this.threadsFile, this.threads)
+        await this.sendAttachments(pending.chat_id, files)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: res.thread_id }))
         return
       }
@@ -630,12 +651,32 @@ export class Daemon {
         })
         this.threads.threads[bound.thread_id]!.last_message_at = Date.now()
         saveThreads(this.threadsFile, this.threads)
+        await this.sendAttachments(bound.chat_id, files)
         conn.write(frame({ id: msg.id, ok: true, message_id: res.message_id, thread_id: bound.thread_id }))
         return
       }
     } catch (err) {
       const m = err instanceof Error ? err.message : String(err)
       try { conn.write(frame({ id: msg.id, ok: false, error: m })) } catch {}
+    }
+  }
+
+  // Feishu's thread endpoint doesn't accept file/image messages, so we send
+  // attachments as separate top-level messages to the same chat — matches the
+  // monolith server.ts behavior before the daemon/shim split. Size is
+  // preflighted so a too-large file surfaces a readable error instead of an
+  // opaque upload failure from the Feishu API.
+  private async sendAttachments(chat_id: string, files: string[]): Promise<void> {
+    if (files.length === 0 || !this.cfg.feishuApi) return
+    const MAX = 50 * 1024 * 1024
+    for (const path of files) {
+      const st = statSync(path)
+      if (st.size > MAX) {
+        throw new Error(`file too large: ${path} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
+      }
+    }
+    for (const path of files) {
+      await this.cfg.feishuApi.sendFile({ chat_id, path })
     }
   }
 

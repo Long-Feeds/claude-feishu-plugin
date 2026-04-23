@@ -26,6 +26,162 @@ export type SendResult = {
   thread_id?: string
 }
 
+type Alignment = "left" | "center" | "right"
+
+function charWidth(ch: string): number {
+  const code = ch.codePointAt(0) ?? 0
+  // East Asian Wide / Fullwidth ranges — counted as two cells so ASCII tables
+  // stay aligned when cells contain CJK.
+  if (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0x9fff) ||
+    (code >= 0xa000 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe4f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x20000 && code <= 0x2fffd) ||
+    (code >= 0x30000 && code <= 0x3fffd)
+  ) {
+    return 2
+  }
+  return 1
+}
+
+function visualWidth(s: string): number {
+  let w = 0
+  for (const ch of s) w += charWidth(ch)
+  return w
+}
+
+function padCell(s: string, width: number, align: Alignment): string {
+  const pad = Math.max(0, width - visualWidth(s))
+  if (align === "right") return " ".repeat(pad) + s
+  if (align === "center") {
+    const left = Math.floor(pad / 2)
+    return " ".repeat(left) + s + " ".repeat(pad - left)
+  }
+  return s + " ".repeat(pad)
+}
+
+function splitTableRow(line: string): string[] | null {
+  const trimmed = line.trim()
+  if (!trimmed.includes("|")) return null
+  let s = trimmed
+  if (s.startsWith("|")) s = s.slice(1)
+  if (s.endsWith("|") && !s.endsWith("\\|")) s = s.slice(0, -1)
+  const cells: string[] = []
+  let cur = ""
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]!
+    if (c === "\\" && i + 1 < s.length) {
+      cur += s[i + 1]!
+      i++
+      continue
+    }
+    if (c === "|") {
+      cells.push(cur.trim())
+      cur = ""
+    } else {
+      cur += c
+    }
+  }
+  cells.push(cur.trim())
+  return cells.length > 0 ? cells : null
+}
+
+function parseAlignments(cells: string[]): Alignment[] | null {
+  const result: Alignment[] = []
+  for (const c of cells) {
+    if (!/^:?-{1,}:?$/.test(c)) return null
+    const left = c.startsWith(":")
+    const right = c.endsWith(":")
+    result.push(left && right ? "center" : right ? "right" : "left")
+  }
+  return result
+}
+
+function renderAsciiTable(
+  headers: string[],
+  aligns: Alignment[],
+  rows: string[][],
+): string {
+  const widths = headers.map((h, i) => {
+    let w = visualWidth(h)
+    for (const r of rows) w = Math.max(w, visualWidth(r[i] ?? ""))
+    return w
+  })
+  const sep = "+" + widths.map((w) => "-".repeat(w + 2)).join("+") + "+"
+  const renderRow = (cells: string[]) =>
+    "| " + widths.map((w, i) => padCell(cells[i] ?? "", w, aligns[i] ?? "left")).join(" | ") + " |"
+  const out: string[] = ["```", sep, renderRow(headers), sep]
+  for (const r of rows) out.push(renderRow(r))
+  out.push(sep, "```")
+  return out.join("\n")
+}
+
+// Feishu's `md` tag in post messages supports a subset of markdown (bold,
+// italic, strikethrough, lists, headings, code, code fences, blockquotes,
+// links) but NOT GFM tables — pipes render as literal text. We rewrite each
+// table into an aligned ASCII table inside a fenced code block so columns
+// stay visually aligned under Feishu's monospace rendering. Everything
+// outside tables passes through untouched.
+export function preprocessMarkdownForFeishu(text: string): string {
+  const lines = text.split("\n")
+  const out: string[] = []
+  let inFence = false
+  let fenceMarker = ""
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]!
+    const fenceMatch = line.match(/^\s*(```+|~~~+)/)
+    if (fenceMatch) {
+      const marker = fenceMatch[1]!
+      if (!inFence) {
+        inFence = true
+        fenceMarker = marker
+      } else if (marker.startsWith(fenceMarker) || fenceMarker.startsWith(marker)) {
+        inFence = false
+        fenceMarker = ""
+      }
+      out.push(line)
+      i++
+      continue
+    }
+    if (inFence) {
+      out.push(line)
+      i++
+      continue
+    }
+    const header = splitTableRow(line)
+    if (header && header.length >= 1 && i + 1 < lines.length) {
+      const sep = splitTableRow(lines[i + 1]!)
+      if (sep && sep.length === header.length) {
+        const aligns = parseAlignments(sep)
+        if (aligns) {
+          const rows: string[][] = []
+          let j = i + 2
+          while (j < lines.length) {
+            const r = splitTableRow(lines[j]!)
+            if (!r) break
+            while (r.length < header.length) r.push("")
+            if (r.length > header.length) r.length = header.length
+            rows.push(r)
+            j++
+          }
+          out.push(renderAsciiTable(header, aligns, rows))
+          i = j
+          continue
+        }
+      }
+    }
+    out.push(line)
+    i++
+  }
+  return out.join("\n")
+}
+
 function buildContent(text: string, format: TextFormat): { content: string; msg_type: string } {
   if (format === "markdown") {
     // Feishu's post format with a single `md` element renders markdown (bold,
@@ -34,9 +190,10 @@ function buildContent(text: string, format: TextFormat): { content: string; msg_
     // routing. Verified with the live API — interactive cards return
     // "The request you send is not a valid operation" when replied into a
     // thread, but post-with-md threads fine.
+    const rendered = preprocessMarkdownForFeishu(text)
     return {
       content: JSON.stringify({
-        zh_cn: { title: "", content: [[{ tag: "md", text }]] },
+        zh_cn: { title: "", content: [[{ tag: "md", text: rendered }]] },
       }),
       msg_type: "post",
     }
