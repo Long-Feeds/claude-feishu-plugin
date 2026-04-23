@@ -7,6 +7,7 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(tmux kill-window *)
 ---
 
 # /feishu:access — Feishu Channel Access Management
@@ -68,11 +69,15 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 3. Extract `senderId` and `chatId` from the pending entry.
 4. Add `senderId` to `allowFrom` (dedupe).
 5. Delete `pending[<code>]`.
-6. Write the updated access.json.
-7. `mkdir -p ~/.claude/channels/feishu/approved` then write
+6. **If `access.hubChatId` is unset (undefined/null), set it to `chatId`.**
+   This is the chat terminal (local terminal) sessions will post their threads into
+   when they call `reply`. First pair wins; rerun `/feishu:configure set-hub <chat_id>`
+   to change later.
+7. Write the updated access.json.
+8. `mkdir -p ~/.claude/channels/feishu/approved` then write
    `~/.claude/channels/feishu/approved/<senderId>` with `chatId` as the
    file contents. The channel server polls this dir and sends "you're in".
-8. Confirm: who was approved (senderId).
+9. Confirm: who was approved (senderId), and whether hubChatId was set this time.
 
 ### `deny <code>`
 
@@ -116,6 +121,28 @@ Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
 - `mentionPatterns`: JSON array of regex strings
 
 Read, set the key, write, confirm.
+
+### `threads` — list known threads and their states
+
+1. Read `~/.claude/channels/feishu/threads.json`; default to empty map if missing.
+2. For each entry, print one line in this shape:
+   `<thread_id>  <status>  <origin>  <cwd>  last_active=<relative time>`
+3. Group output by status: active first, then inactive, then closed.
+
+### `thread close <thread_id>` — archive a thread
+
+1. Read `~/.claude/channels/feishu/threads.json`.
+2. Set `threads[<thread_id>].status = "closed"`.
+3. Write back.
+4. Confirm; note that replies in closed threads get an auto "thread closed" reply.
+
+### `thread kill <thread_id>` — terminate a running session's tmux window
+
+1. Read threads.json; find the thread.
+2. If `status !== "active"`, tell the user nothing is running and stop.
+3. Look up `spawn_env.tmux_window_name`; fall back to `fb:<session_id_prefix>` if missing (prefix = first 8 chars of `session_id`).
+4. Run: `tmux kill-window -t claude-feishu:<window_name>`.
+5. Note: daemon observes the shim EOF and marks status=inactive automatically; no need to touch threads.json here.
 
 ---
 

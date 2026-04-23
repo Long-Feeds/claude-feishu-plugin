@@ -13,6 +13,12 @@ export type ThreadRecord = {
   status: "active" | "inactive" | "closed"
   last_active_at: number
   last_message_at: number
+  // tmux window name owning the claude pane for this thread, reported by
+  // the shim at register time. Recorded here so the idle sweeper can
+  // `tmux kill-window` the correct pane even after the shim has
+  // disconnected (SessionEntry is gone by then). Legacy records without
+  // this field fall back to `fb:<session_id[:8]>` in the sweeper.
+  tmux_window_name?: string
   spawn_env?: Record<string, string>
 }
 
@@ -93,10 +99,23 @@ export function findBySessionId(
   store: ThreadStore,
   session_id: string,
 ): (ThreadRecord & { thread_id: string }) | undefined {
+  // Defense in depth: under normal operation every session_id binds to at
+  // most one thread record. A prior UUID-probe race in the shim could
+  // register two different claude processes under the same session_id,
+  // producing multiple bindings; a naive "first match wins" iteration
+  // then routed replies to whichever record happened to be inserted
+  // first, never the triggering one. Always pick the newest-active match
+  // so a lingering duplicate from the past doesn't silently shadow the
+  // current session. Cost on the happy path is a full iteration of
+  // threads (O(n)) — threads.json rarely exceeds a few hundred rows.
+  let best: (ThreadRecord & { thread_id: string }) | undefined
   for (const [tid, rec] of Object.entries(store.threads)) {
-    if (rec.session_id === session_id) return { ...rec, thread_id: tid }
+    if (rec.session_id !== session_id) continue
+    if (!best || rec.last_active_at > best.last_active_at) {
+      best = { ...rec, thread_id: tid }
+    }
   }
-  return undefined
+  return best
 }
 
 export function markInactive(store: ThreadStore, session_id: string): void {

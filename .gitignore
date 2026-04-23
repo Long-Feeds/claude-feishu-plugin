@@ -12,3 +12,4 @@ node_modules/
 *.log
 *.tsbuildinfo
 .DS_Store
+.gdpa

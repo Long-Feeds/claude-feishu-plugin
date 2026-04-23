@@ -6,24 +6,50 @@
 
 ## 架构
 
-- 单文件 MCP Server (`server.ts`)，通过 stdio 与 Claude Code 通信
-- 使用 `@larksuiteoapi/node-sdk` 的 WSClient (WebSocket 长连接) 接收飞书事件，无需公网 IP
-- 访问控制：pairing（配对码）→ allowlist（白名单）→ disabled
-- 状态文件存储在 `~/.claude/channels/feishu/`
+- **daemon** (`src/daemon.ts`) 作为 systemd user service 跑，独占 WSClient，负责
+  所有 Feishu API + 路由 + spawn 新 session（`tmux new-window` in session
+  `claude-feishu`）。
+- **shim** (`src/shim.ts`) 由 Claude Code 通过 `.mcp.json` 拉起，每个 Claude
+  session 一个，是 MCP stdio ↔ daemon Unix socket 的翻译层。
+- **access / threads 状态** 在 `~/.claude/channels/feishu/` 下：`.env` +
+  `access.json`（含 `hubChatId`）+ `threads.json`（thread_id → session 绑定）。
+- **同一 APP_ID 只能有一个 WSClient** — daemon 是唯一持有者，shim 绝不直接连飞书。
 
 ## 文件结构
 
 ```
 .claude-plugin/plugin.json    # 插件元数据
-.mcp.json                     # MCP Server 启动配置 (bun runtime)
-package.json                  # 依赖: @modelcontextprotocol/sdk, @larksuiteoapi/node-sdk
-server.ts                     # 单文件 MCP Server (~1000行)
-skills/configure/SKILL.md     # /feishu:configure 技能（配置凭证）
-skills/access/SKILL.md        # /feishu:access 技能（管理访问控制）
-test-ws.ts                    # 独立 WebSocket 测试脚本（调试用）
-README.md                     # 用户文档
-ACCESS.md                     # 访问控制详细文档
-LICENSE                       # Apache-2.0
+.mcp.json                     # 拉起 shim（`bun run shim`）
+package.json                  # 依赖 + scripts (daemon / shim / start / test)
+server.ts                     # 旧单文件实现；作为 rollback 保留
+src/
+  daemon.ts                   # systemd 拉起的主进程；WSClient + router + spawn
+  shim.ts                     # Claude 加载的 MCP server；stdio ↔ socket
+  ipc.ts                      # NDJSON 协议 + 类型
+  access.ts                   # access.json 读写
+  threads.ts                  # threads.json + 状态机
+  feishu-api.ts               # Feishu API 封装（sendRoot / sendInThread / ...）
+  spawn.ts                    # tmux new-window 包装
+  daemon-state.ts             # daemon 内存 session 注册表
+  gate.ts                     # 纯函数访问门控
+  inbound.ts                  # Feishu event 文本+附件提取
+tests/                        # bun:test
+  smoke.test.ts
+  ipc.test.ts
+  access.test.ts
+  threads.test.ts
+  feishu-api.test.ts
+  spawn.test.ts
+  gate.test.ts
+  daemon-routing.test.ts
+  integration/
+    fake-daemon.ts
+    shim.test.ts
+systemd/
+  claude-feishu.service.tmpl  # 由 /feishu:configure install-service 渲染
+skills/
+  configure/SKILL.md
+  access/SKILL.md
 ```
 
 ## 关键技术选型
@@ -71,6 +97,16 @@ LICENSE                       # Apache-2.0
   重定向到 stderr。新增日志一律走 `process.stderr.write` 或 `console.error`。
 - **double-reply on pair**：pairing 模式下 `replies` 计数限制为 2，避免被恶
   意刷码。改 gate 时小心别破坏这个上限。
+- **systemd 的 PATH 很窄**：daemon unit 里显式写 `Environment=PATH=$HOME/.bun/bin:...`
+  才能找到 bun。升级 bun 或移动安装路径时，记得同步改 unit 文件或重装服务
+  （`/feishu:configure install-service`）。
+- **shim 重连必须用同一个 session_id 重注册**：daemon 重启后每个 shim 会自动
+  指数退避重连，关键是用**原来的** session_id 再次 register，daemon 才能从
+  threads.json 恢复 thread 绑定。改 shim 的 keepAlive 循环时小心别丢掉这点。
+- **workspace 的改动不会直接生效**：systemd daemon 跑的是 `~/.claude/plugins/cache/claude-feishu/feishu/0.0.1/`
+  下的拷贝，不是 `~/workspace/claude-feishu-plugin/`。本地改完代码要么重装插件，
+  要么直接 `bun sync`（见 package.json，做 rsync + restart）。忘记同步会让你盯着
+  旧代码的日志排查新代码的 bug。
 
 ## 开发/调试命令
 
@@ -88,6 +124,9 @@ bun server.ts
 # 查看当前访问控制状态
 cat ~/.claude/channels/feishu/access.json
 ```
+
+改完代码的自验证流程（fork claude 子进程 + lark-cli 主动发消息，
+全程无需人为参与）：见 `docs/self-validation.md`。
 
 ## 飞书应用配置要求
 
