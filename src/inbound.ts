@@ -36,6 +36,28 @@ export function extractCardText(node: any, out: string[] = []): string[] {
   return out
 }
 
+// Pull text out of one inline post node. Earlier code allow-listed tag in
+// {text, a} only, which silently dropped every other rich-text tag — the
+// most common casualty being `code_block`, so a user pasting code into the
+// bot DM landed in Claude's lap as "(rich text)" with the actual code lost.
+// This is now an opt-OUT list (drop @mentions and bare image refs since
+// Claude can't act on them as inline text), with `code_block` re-fenced as
+// a markdown code block so Claude sees the language.
+function extractInlineText(node: any): string {
+  if (!node || typeof node !== "object") return ""
+  const tag = node.tag
+  if (tag === "at") return ""   // @mention placeholder, no useful text
+  if (tag === "img") return ""  // image ref, no inline text payload
+  if (tag === "code_block") {
+    const lang = typeof node.language === "string" ? node.language : ""
+    const body = typeof node.text === "string" ? node.text : ""
+    return `\n\`\`\`${lang}\n${body}\n\`\`\`\n`
+  }
+  // Default: take whatever text/href the tag carries. Covers text, a, md,
+  // lark_md, code, emotion, hr, quote, etc.
+  return node.text ?? node.href ?? ""
+}
+
 export function extractTextAndAttachment(event: any): {
   text: string; attachment?: AttachmentMeta; imagePath?: string;
 } {
@@ -57,8 +79,8 @@ export function extractTextAndAttachment(event: any): {
         if (postContent?.title) parts.push(postContent.title)
         for (const para of postContent?.content ?? []) {
           const line = (para as any[])
-            .filter((n: any) => n.tag === "text" || n.tag === "a")
-            .map((n: any) => n.text ?? n.href ?? "")
+            .map((n: any) => extractInlineText(n))
+            .filter(Boolean)
             .join("")
           if (line) parts.push(line)
         }
