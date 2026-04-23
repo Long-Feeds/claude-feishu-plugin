@@ -785,6 +785,193 @@ test("hook_post with no thread but a pending announce root seeds the thread", as
   await daemon.stop()
 })
 
+test("hook_post with no thread AND no pendingRoot bootstraps an announce + threaded mirror (orphan rescue)", async () => {
+  // Real-world cause: shim died on UUID-probe FATAL, or the session predates
+  // a daemon restart, or Stop fired before user_prompt could create the
+  // pendingRoot (fast-turn race in fresh sessions). The hook payload itself
+  // carries enough (uuid + cwd + text) — daemon should bootstrap rather than
+  // silently drop, otherwise the operator sees no Feishu activity at all.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const calls: { op: "create" | "reply"; a: any }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "om_orphan_root" } } },
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_orphan_seed", thread_id: "t_orphan" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const out: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => out.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  // No register, no user_prompt — orphan hook arrives directly.
+  s.write(frame({
+    id: 1, op: "hook_post",
+    claude_session_uuid: "uuid-orphan",
+    cwd: "/proj/orphan",
+    text: "Investigated /tmp/foo and found three stale lockfiles.",
+  }))
+  await wait(80)
+
+  const created = calls.filter((c) => c.op === "create")
+  const replied = calls.filter((c) => c.op === "reply")
+  expect(created.length).toBe(1)
+  expect(created[0].a.params.receive_id_type).toBe("chat_id")
+  const announceMd = JSON.parse(created[0].a.data.content).zh_cn.content[0][0].text as string
+  expect(announceMd).toContain("uuid-orphan")
+  expect(announceMd).toContain("/proj/orphan")
+  expect(replied.length).toBe(1)
+  expect(replied[0].a.path.message_id).toBe("om_orphan_root")
+  expect(replied[0].a.data.reply_in_thread).toBe(true)
+  const mirrorMd = JSON.parse(replied[0].a.data.content).zh_cn.content[0][0].text as string
+  expect(mirrorMd).toContain("Investigated /tmp/foo")
+
+  const ack = out.find((m) => m.id === 1)
+  expect(ack?.ok).toBe(true)
+  expect(ack?.thread_id).toBe("t_orphan")
+
+  // Bootstrap binds the thread directly so future hook_posts route into the
+  // same thread instead of bootstrapping a second announce.
+  const after = (await import("../src/threads")).loadThreads(join(dir, "threads.json"))
+  const bound = Object.values(after.threads).find((r) => r.session_id === "uuid-orphan")
+  expect(bound?.status).toBe("active")
+  expect(bound?.origin).toBe("terminal")
+  expect(bound?.root_message_id).toBe("om_orphan_root")
+  // Bootstrap must NOT leave a pendingRoots entry behind — the thread is
+  // already seeded.
+  expect(after.pendingRoots?.["uuid-orphan"]).toBeUndefined()
+
+  s.end()
+  await daemon.stop()
+})
+
+test("hook_post bootstrap uses a buffered user_prompt as the announce title when present", async () => {
+  // The classic orphan-rescue fallback uses the first line of the hook text
+  // as title, but if a UserPromptSubmit hook fired earlier in the same cwd
+  // and parked its prompt because no shim was registered to consume it, we
+  // prefer that prompt — it's what the user actually typed, not our paraphrase
+  // of what Claude said back.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const calls: { op: "create" | "reply"; a: any }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "om_root_titled" } } },
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_seed", thread_id: "t_titled" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  s.on("data", () => {})
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  // user_prompt arrives first — no shim registered, so it gets buffered by cwd.
+  s.write(frame({
+    id: 1, op: "user_prompt",
+    claude_session_uuid: "uuid-titled",
+    cwd: "/proj/titled",
+    prompt: "fix the failing snapshot test",
+  }))
+  await wait(40)
+  // Then the Stop hook arrives — bootstrap should drain the buffered prompt.
+  s.write(frame({
+    id: 2, op: "hook_post",
+    claude_session_uuid: "uuid-titled",
+    cwd: "/proj/titled",
+    text: "Snapshot regenerated; tests pass now.",
+  }))
+  await wait(80)
+
+  const created = calls.filter((c) => c.op === "create")
+  expect(created.length).toBe(1)
+  const titleMd = JSON.parse(created[0].a.data.content).zh_cn.content[0][0].text as string
+  expect(titleMd).toContain("fix the failing snapshot test")
+
+  s.end()
+  await daemon.stop()
+})
+
+test("hook_post bootstrap is suppressed for closed threads (respects explicit close)", async () => {
+  // If the user explicitly closed a thread, late hook_post events for that
+  // session_id must NOT mint a fresh thread — the close is intentional.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const calls: { op: "create" | "reply"; a: any }[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async (a) => { calls.push({ op: "create", a }); return { data: { message_id: "must_not_be_called" } } },
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "must_not_be_called" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_closed"] = {
+    session_id: "uuid-closed", chat_id: "oc_hub", root_message_id: "om_closed_root",
+    cwd: "/proj/closed", origin: "terminal", status: "closed",
+    last_active_at: Date.now(), last_message_at: Date.now(),
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+  })
+
+  const s = connect(sock)
+  const parser = new NdjsonParser()
+  const out: any[] = []
+  s.on("data", (buf: Buffer) => parser.feed(buf.toString("utf8"), (m) => out.push(m)))
+  await new Promise<void>((r) => s.on("connect", () => r()))
+  s.write(frame({
+    id: 1, op: "hook_post",
+    claude_session_uuid: "uuid-closed",
+    cwd: "/proj/closed",
+    text: "this should not show up anywhere",
+  }))
+  await wait(60)
+
+  expect(calls.length).toBe(0)
+  const ack = out.find((m) => m.id === 1)
+  expect(ack?.ok).toBe(false)
+  s.end()
+  await daemon.stop()
+})
+
 test("delivered inbound message gets a 'received' emoji reaction on the trigger", async () => {
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
