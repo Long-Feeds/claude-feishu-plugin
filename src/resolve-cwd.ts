@@ -125,10 +125,15 @@ function defaultListProjectJsonls(projectDir: string): { name: string; mtimeMs: 
   } catch { return [] }
 }
 
-// Claude's project-dir slug is the absolute cwd path with `/` → `-`, with
-// a leading `-` (because the cwd starts with `/`).
+// Claude Code's project-dir slug: replace `/` AND `.` with `-`. The `.`
+// transform tripped us up in deployment — `/data00/home/xiaolong.835/…`
+// becomes `-data00-home-xiaolong-835-…` (not `-data00-home-xiaolong.835-…`),
+// so missing the dot transform made shim's probe look in a non-existent
+// dir for fresh feishu-spawn sessions (and silently fall through to
+// register-null / hard-exit). Any other chars Claude translates should be
+// added here when we spot them in the wild.
 export function cwdToProjectSlug(cwd: string): string {
-  return cwd.replace(/\//g, "-")
+  return cwd.replace(/[./]/g, "-")
 }
 
 export type SessionUuidOpts = ResolveOpts & {
@@ -156,4 +161,46 @@ export function findClaudeSessionUuid(opts: SessionUuidOpts = {}): string | null
   const base = newest.name.replace(/\.jsonl$/, "")
   if (!/^[0-9a-f-]{20,}$/i.test(base)) return null
   return base
+}
+
+// Daemon-side helper: spawn a claude in `cwd`, then poll the project jsonl
+// directory for a *newly-created* jsonl file. The file's basename is the
+// session UUID — that's Claude Code's authoritative identity (stable across
+// --continue / --resume). This is how daemon converts "I just ran `tmux
+// new-window claude`" into a real session_id WITHOUT needing the shim to
+// register first (the shim will also probe the same jsonl and arrive at the
+// same UUID — we just don't want to wait on that round-trip before saving
+// the thread_id ↔ session_id mapping).
+export type PollNewUuidOpts = {
+  claudeHome?: string
+  timeoutMs?: number           // default 10_000
+  pollIntervalMs?: number      // default 200
+  listJsonls?: JsonlLister
+  now?: () => number           // test injection
+  sleep?: (ms: number) => Promise<void>  // test injection
+}
+export async function pollForNewClaudeSessionUuid(
+  cwd: string,
+  opts: PollNewUuidOpts = {},
+): Promise<string | null> {
+  const home = opts.claudeHome ?? `${process.env.HOME ?? ""}/.claude`
+  const projectDir = `${home}/projects/${cwdToProjectSlug(cwd)}`
+  const list = opts.listJsonls ?? defaultListProjectJsonls
+  const before = new Set(list(projectDir).map((x) => x.name))
+  const timeoutMs = opts.timeoutMs ?? 10_000
+  const interval = opts.pollIntervalMs ?? 200
+  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
+  const now = opts.now ?? Date.now
+  const deadline = now() + timeoutMs
+  while (now() < deadline) {
+    const current = list(projectDir)
+    for (const entry of current) {
+      if (before.has(entry.name)) continue
+      const base = entry.name.replace(/\.jsonl$/, "")
+      if (!/^[0-9a-f-]{20,}$/i.test(base)) continue
+      return base
+    }
+    await sleep(interval)
+  }
+  return null
 }

@@ -31,6 +31,11 @@ export type RegisterReq = {
   session_id: string | null
   pid: number
   cwd: string
+  // The tmux window the shim is running inside, resolved from $TMUX_PANE.
+  // Daemon stores this on the SessionEntry so inbound feishu messages can be
+  // send-keys'd back into the right pane. Unset when shim runs outside tmux
+  // (terminal-origin sessions don't need this — they receive via MCP push).
+  tmux_window_name?: string
 }
 
 export type ReplyReq = {
@@ -38,7 +43,7 @@ export type ReplyReq = {
   op: "reply"
   text: string
   files?: string[]
-  format?: "text" | "post"
+  format?: "text" | "post" | "markdown"
   reply_to?: string | null
 }
 
@@ -54,7 +59,7 @@ export type EditReq = {
   op: "edit_message"
   message_id: string
   text: string
-  format?: "text" | "post"
+  format?: "text" | "post" | "markdown"
 }
 
 export type DownloadReq = {
@@ -94,6 +99,19 @@ export type HookPostReq = {
   text: string
 }
 
+// External UserPromptSubmit-hook post: fires each time the user submits a
+// prompt in a terminal-origin session. Daemon uses the FIRST such prompt as
+// the title of the hub announce (before this, register-time announces used
+// a generic "Claude Code session online" string, which gave operators no
+// clue what the session was working on). Subsequent prompts are no-ops.
+export type UserPromptReq = {
+  id: number
+  op: "user_prompt"
+  claude_session_uuid: string
+  cwd: string
+  prompt: string
+}
+
 export type ShimReq =
   | RegisterReq
   | ReplyReq
@@ -103,6 +121,7 @@ export type ShimReq =
   | PermissionReq
   | SessionInfoReq
   | HookPostReq
+  | UserPromptReq
 
 // ─── Daemon → shim responses & pushes ───────────────────────────────────
 

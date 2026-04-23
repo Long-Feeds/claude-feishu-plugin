@@ -157,6 +157,24 @@ export function findRecentTerminalThreadForCwd(
   return best
 }
 
+// Drop pendingRoots older than the cutoff. A pendingRoot exists only until
+// the session makes its first MCP reply (at which point it graduates to a
+// real thread binding), so any entry sitting around for hours is almost
+// certainly an ephemeral `claude` invocation that died before replying —
+// keeping them around forever bloats threads.json and pollutes recent-cwd
+// lookups in handleRegister. Returns dropped session_ids for logging.
+export function prunePendingRoots(store: ThreadStore, olderThanMs: number): string[] {
+  if (!store.pendingRoots) return []
+  const cutoff = Date.now() - olderThanMs
+  const pruned: string[] = []
+  for (const [sid, pr] of Object.entries(store.pendingRoots)) {
+    if (pr.created_at > cutoff) continue
+    delete store.pendingRoots[sid]
+    pruned.push(sid)
+  }
+  return pruned
+}
+
 export function pruneInactive(store: ThreadStore, olderThanMs: number): string[] {
   // Drops inactive threads older than the cutoff, but keeps:
   //   - active (live sessions)

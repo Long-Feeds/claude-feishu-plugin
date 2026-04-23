@@ -5,7 +5,7 @@ import { tmpdir } from "os"
 import {
   loadThreads, saveThreads, upsertThread, markInactive, markActive,
   close as closeThread, findBySessionId, findByThreadId, pruneInactive,
-  findRecentTerminalThreadForCwd,
+  findRecentTerminalThreadForCwd, prunePendingRoots,
 } from "../src/threads"
 
 let file: string
@@ -96,6 +96,19 @@ test("pruneInactive drops old inactive but keeps active, closed, and resumable",
   expect(Object.keys(store.threads).sort()).toEqual([
     "t_active", "t_old_closed", "t_old_resumable", "t_recent_inactive",
   ])
+})
+
+test("prunePendingRoots drops entries older than cutoff, keeps fresh ones", () => {
+  const store = loadThreads(file)
+  const now = Date.now()
+  store.pendingRoots = {
+    sid_fresh: { chat_id: "c", root_message_id: "m1", created_at: now - 30_000 },
+    sid_hour_old: { chat_id: "c", root_message_id: "m2", created_at: now - 3600_000 },
+    sid_day_old: { chat_id: "c", root_message_id: "m3", created_at: now - 86_400_000 },
+  }
+  const pruned = prunePendingRoots(store, 3600_000)
+  expect(pruned.sort()).toEqual(["sid_day_old", "sid_hour_old"])
+  expect(Object.keys(store.pendingRoots).sort()).toEqual(["sid_fresh"])
 })
 
 test("findRecentTerminalThreadForCwd returns newest non-closed terminal thread for cwd", () => {

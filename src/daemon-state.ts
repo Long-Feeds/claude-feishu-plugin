@@ -6,6 +6,11 @@ export type SessionEntry = {
   cwd: string
   pid: number
   registered_at: number
+  // tmux window the shim's claude is running inside (e.g. "fb:gzaj6ax7").
+  // Reported by the shim from $TMUX_PANE at register time. Required for
+  // routing feishu inbound back to the right pane via tmux send-keys.
+  // Survives daemon restart because shim re-registers on reconnect.
+  tmux_window_name?: string
 }
 
 export class DaemonState {
@@ -35,5 +40,18 @@ export class DaemonState {
 
   all(): SessionEntry[] {
     return [...this.sessions.values()]
+  }
+
+  // Find the most-recently-registered live session for a cwd. Used by the
+  // UserPromptSubmit hook path, where the hook carries the Claude session
+  // UUID but the shim may have registered under a ULID (jsonl probe timed
+  // out). Matching by cwd bridges that gap.
+  findNewestTerminalForCwd(cwd: string): SessionEntry | undefined {
+    let best: SessionEntry | undefined
+    for (const s of this.sessions.values()) {
+      if (s.cwd !== cwd) continue
+      if (!best || s.registered_at > best.registered_at) best = s
+    }
+    return best
   }
 }

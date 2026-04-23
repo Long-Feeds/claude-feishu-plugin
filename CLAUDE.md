@@ -125,6 +125,9 @@ bun server.ts
 cat ~/.claude/channels/feishu/access.json
 ```
 
+改完代码的自验证流程（fork claude 子进程 + lark-cli 主动发消息，
+全程无需人为参与）：见 `docs/self-validation.md`。
+
 ## 飞书应用配置要求
 
 1. 飞书开放平台创建自建应用 (open.feishu.cn)

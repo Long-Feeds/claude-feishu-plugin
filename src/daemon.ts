@@ -1,7 +1,6 @@
 import { createServer, Server, Socket } from "net"
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "fs"
 import { join } from "path"
-import { ulid } from "ulid"
 import * as lark from "@larksuiteoapi/node-sdk"
 import { DaemonState } from "./daemon-state"
 import { NdjsonParser, frame, type ShimReq, type DaemonMsg } from "./ipc"
@@ -10,8 +9,8 @@ import type { ReactReq, EditReq, DownloadReq, PermissionReq, SessionInfoReq, Hoo
 import type { FeishuApi } from "./feishu-api"
 import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
-import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, findRecentTerminalThreadForCwd, findRecentPendingRootForCwd, markActive, markInactive, pruneInactive, type ThreadStore, type ThreadRecord } from "./threads"
-import { buildSpawnCommand, ensureTmuxSession } from "./spawn"
+import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, pruneInactive, prunePendingRoots, type ThreadStore, type ThreadRecord } from "./threads"
+import { buildSpawnCommand, ensureTmuxSession, tmuxNameSlug } from "./spawn"
 import { extractTextAndAttachment } from "./inbound"
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
@@ -28,6 +27,14 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 // pair already gets a visible text response carrying the pairing code.
 const REACT_DOING = process.env.FEISHU_REACT_DOING ?? "OnIt"
 const REACT_CLOSED = process.env.FEISHU_REACT_CLOSED ?? "CrossMark"
+
+// How long a UserPromptSubmit-buffered prompt stays eligible to seed the
+// terminal-announce title. Sized to comfortably exceed the shim's UUID probe
+// deadline (default 30s in shim.ts) plus claude's MCP-server boot time.
+// Shorter values silently dropped manual-start prompts whose shim took >10s
+// to register, leaving sessions un-announced or titled by an irrelevant
+// later prompt.
+const PENDING_PROMPT_TTL_MS = Number(process.env.FEISHU_PENDING_PROMPT_TTL_MS ?? "60000")
 
 export type SendKeysMeta = {
   chat_id?: string; thread_id?: string; message_id?: string;
@@ -104,6 +111,25 @@ export class Daemon {
   // Terminal-origin sessions that registered while hubChatId was unset —
   // announce them once the first delivered inbound auto-populates the hub.
   private deferredTerminalAnnounce = new Map<string, { cwd: string }>()
+  // cwd-prefix allowlist-out: any terminal session whose cwd starts with one
+  // of these paths is silently bridged out — no announce, no pendingRoot, no
+  // bridge-hint. Use case: vibe-kanban worktrees spawn many short-lived claude
+  // subagents whose announces would spam the hub.
+  private ignoredCwdPrefixes: string[] = []
+  // cwd → first user prompt buffered because it arrived BEFORE the shim
+  // finished registering. Happens in `claude --print` and any other fast
+  // spawn: the UserPromptSubmit hook fires as soon as the user hits enter
+  // (or, in --print, on CLI-arg parse), while the shim may still be in its
+  // 3s jsonl-UUID probe loop. handleRegister drains this map if it sees a
+  // matching cwd.
+  private pendingUserPrompts = new Map<string, { prompt: string; ts: number }>()
+
+  // Per-session count of MCP `reply` calls within the current Claude turn.
+  // Reset on UserPromptSubmit (turn start), incremented on every handleReply,
+  // checked in handleHookPost — when reply already ran this turn, the Stop
+  // hook's mirror is redundant ("Reply sent." duplicate of Claude's reply
+  // content) and gets skipped.
+  private turnReplyCounts = new Map<string, number>()
 
   private constructor(private cfg: DaemonConfig) {
     this.pidFile = join(cfg.stateDir, "daemon.pid")
@@ -117,7 +143,13 @@ export class Daemon {
     for (const [sid, pr] of Object.entries(this.threads.pendingRoots ?? {})) {
       this.pendingRoots.set(sid, { chat_id: pr.chat_id, root_message_id: pr.root_message_id })
     }
+    const raw = process.env.FEISHU_IGNORE_CWD_PREFIXES ?? "/var/tmp/vibe-kanban/"
+    this.ignoredCwdPrefixes = raw.split(",").map((s) => s.trim()).filter(Boolean)
     this.server = createServer((conn) => this.onConn(conn))
+  }
+
+  private isIgnoredCwd(cwd: string): boolean {
+    return this.ignoredCwdPrefixes.some((p) => cwd.startsWith(p))
   }
 
   private persistPendingRoot(
@@ -160,6 +192,17 @@ export class Daemon {
       process.stderr.write(`daemon: pruned ${pruned.length} inactive thread(s) older than ${ttlDays}d\n`)
       changed = true
     }
+    // pendingRoots age out independently (shorter window — these are
+    // unresolved announces from claudes that never replied). Also rehydrate
+    // the in-memory map afterward so it matches the pruned on-disk state.
+    const pendingHours = Number(process.env.FEISHU_PENDING_ROOTS_TTL_HOURS ?? "1")
+    const pendingTtlMs = Number.isFinite(pendingHours) && pendingHours > 0 ? pendingHours * 3600_000 : 3600_000
+    const prunedPending = prunePendingRoots(d.threads, pendingTtlMs)
+    if (prunedPending.length > 0) {
+      process.stderr.write(`daemon: pruned ${prunedPending.length} pending root(s) older than ${pendingHours}h\n`)
+      for (const sid of prunedPending) d.pendingRoots.delete(sid)
+      changed = true
+    }
     if (changed) saveThreads(d.threadsFile, d.threads)
     await d.bindSocket()
     await cfg.wsStart()
@@ -196,11 +239,12 @@ export class Daemon {
   }
 
   private onConn(conn: Socket): void {
+    process.stderr.write(`daemon: onConn new socket connection\n`)
     const parser = new NdjsonParser()
     conn.on("data", (buf: Buffer) => {
       parser.feed(buf.toString("utf8"), (msg) => this.onMessage(conn, msg as ShimReq))
     })
-    conn.on("close", () => this.onClose(conn))
+    conn.on("close", () => { process.stderr.write(`daemon: onClose socket connection\n`); this.onClose(conn) })
     conn.on("error", () => { try { conn.destroy() } catch {} })
   }
 
@@ -214,6 +258,7 @@ export class Daemon {
       case "permission_request": return void this.handlePermissionRequest(conn, msg as PermissionReq)
       case "session_info": return void this.handleSessionInfo(conn, msg as SessionInfoReq)
       case "hook_post": return void this.handleHookPost(conn, msg as HookPostReq)
+      case "user_prompt": return this.handleUserPrompt(conn, msg as Extract<ShimReq, { op: "user_prompt" }>)
       default:
         try {
           conn.write(frame({ id: (msg as any).id, ok: false, error: `unknown op: ${(msg as any).op}` }))
@@ -222,30 +267,22 @@ export class Daemon {
   }
 
   private handleRegister(conn: Socket, msg: Extract<ShimReq, { op: "register" }>): void {
-    // Primary continuity mechanism: the shim hands us Claude Code's session
-    // UUID (read from the parent claude process's open jsonl fd). That UUID
-    // is stable across `claude --resume` — same UUID means same conversation
-    // means same thread. So we just route on session_id without any cwd magic.
-    //
-    // Fallback: if shim couldn't resolve a UUID (e.g. fresh `claude` registered
-    // before it opened its jsonl), it sends null. We first try to recycle a
-    // prior terminal thread bound to the same cwd, then fall back to minting
-    // a fresh ULID.
-    let session_id: string
-    if (msg.session_id) {
-      session_id = msg.session_id
-    } else {
-      const prior = findRecentTerminalThreadForCwd(this.threads, msg.cwd)
-      if (prior) {
-        session_id = prior.session_id
-        process.stderr.write(`daemon: terminal register (null session_id) reused session=${session_id} from cwd=${msg.cwd}\n`)
-      } else {
-        session_id = ulid()
-      }
+    // session_id MUST be the real Claude session UUID (basename of
+    // ~/.claude/projects/<cwd-slug>/<uuid>.jsonl). Shim is responsible for
+    // resolving it from the jsonl before calling register. Reject anything
+    // else — we used to mint a ULID here as a fallback, which led to a
+    // two-key ghost state (hooks keyed by UUID, shim keyed by ULID) and
+    // every subsequent routing bug was downstream of that compromise.
+    process.stderr.write(`daemon: handleRegister session_id=${msg.session_id} cwd=${msg.cwd} pid=${msg.pid}\n`)
+    if (!msg.session_id) {
+      try { conn.write(frame({ id: msg.id, ok: false, error: "session_id required — shim must resolve claude UUID before register" })) } catch {}
+      return
     }
+    const session_id: string = msg.session_id
 
     this.state.register({
       session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
+      ...(msg.tmux_window_name ? { tmux_window_name: msg.tmux_window_name } : {}),
     })
     // If the session already has a thread binding, flip status back to active
     // (e.g. shim reconnecting after daemon restart, or resume-dedup match).
@@ -257,79 +294,100 @@ export class Daemon {
       conn.write(frame({ id: msg.id, ok: true, session_id, thread_id: null }))
     } catch {}
 
-    // Terminal auto-announce: a fresh terminal `claude` invocation loads the
-    // plugin, shim registers, daemon needs to surface the session somewhere
-    // on Feishu so the operator can reply into it. Post a root "online"
-    // message to the hub and prime pendingRoots so the session's first MCP
-    // reply seeds a thread off that announce (instead of creating a second
-    // root). We skip:
+    // Terminal registration paths we skip from any Feishu side-effect:
     //   - feishu-spawned sessions (pendingFeishuInbound carries their trigger),
     //   - sessions that already own a thread (resume of a known session —
     //     route into the existing thread, don't announce again),
-    //   - sessions that already have a pendingRoots entry (reconnect within
-    //     the same daemon lifetime).
-    const isFeishuSpawn = this.pendingFeishuInbound.has(session_id)
+    //   - sessions that already have a pendingRoots entry (announce already
+    //     posted and waiting for first reply to seed thread),
+    //   - cwd matches an ignored prefix (vibe-kanban worktrees by default):
+    //     those subagents would otherwise spam the hub every time the harness
+    //     fires up a fresh `claude`.
+    //
+    // The announce itself is DEFERRED — we no longer post `🟢 session online`
+    // at register time. The title of the announce comes from the user's FIRST
+    // prompt (UserPromptSubmit hook → handleUserPrompt), so operators can tell
+    // at a glance what the session is working on. Register-time still pushes
+    // the bridge-hint inbound so Claude knows about the mirror before turn 1.
+    // feishu-spawn resolution: shim registered with a real UUID (probed
+    // from the jsonl that claude wrote when we send-keys'd the trigger
+    // prompt into the pane). Pair it with the cwd-keyed spawn intent
+    // parked by spawnFeishu.
+    const spawnIntent = this.pendingFeishuSpawns.get(msg.cwd)
+    if (spawnIntent) {
+      this.pendingFeishuSpawns.delete(msg.cwd)
+      // Bind the feishu state to the real UUID now that we know it.
+      if (spawnIntent.preExistingThreadId) {
+        upsertThread(this.threads, spawnIntent.preExistingThreadId, {
+          session_id, chat_id: spawnIntent.event.message.chat_id,
+          root_message_id: spawnIntent.event.message.message_id, cwd: msg.cwd,
+          origin: "feishu", status: "active",
+          last_active_at: Date.now(), last_message_at: Date.now(),
+        })
+        saveThreads(this.threadsFile, this.threads)
+      } else {
+        this.pendingFeishuRoots.set(session_id, {
+          chat_id: spawnIntent.event.message.chat_id,
+          root_message_id: spawnIntent.event.message.message_id,
+        })
+      }
+      process.stderr.write(`daemon: feishu-spawn bound cwd=${msg.cwd} session=${session_id}\n`)
+    }
+    const isFeishuSpawn = this.pendingFeishuInbound.has(session_id) || !!spawnIntent
     const alreadyBound = !!findBySessionId(this.threads, session_id)
     const alreadyPending = this.pendingRoots.has(session_id)
-    if (
+    const ignoredCwd = this.isIgnoredCwd(msg.cwd)
+    if (ignoredCwd) {
+      process.stderr.write(`daemon: terminal register ignored (cwd=${msg.cwd} matches an ignore prefix) session=${session_id}\n`)
+    } else if (
       !isFeishuSpawn && !alreadyBound && !alreadyPending &&
       this.cfg.feishuApi
     ) {
       const hub = loadAccess(this.accessFile).hubChatId
       if (hub) {
-        this.sendTerminalAnnounce(session_id, hub, msg.cwd)
+        this.scheduleBridgeHint(session_id, hub)
+        // Drain: a UserPromptSubmit hook that arrived before register (common
+        // in `claude --print` where the shim's 3s UUID probe lets the hook
+        // frame win the race) parked its prompt in pendingUserPrompts keyed
+        // by cwd. If we have one fresh enough, announce with it right now.
+        const buffered = this.pendingUserPrompts.get(msg.cwd)
+        if (buffered && Date.now() - buffered.ts < PENDING_PROMPT_TTL_MS) {
+          this.pendingUserPrompts.delete(msg.cwd)
+          this.sendTerminalAnnounce(session_id, hub, msg.cwd, this.titleFromPrompt(buffered.prompt))
+        }
       } else {
         this.deferredTerminalAnnounce.set(session_id, { cwd: msg.cwd })
-        process.stderr.write(`daemon: terminal session=${session_id} registered but hubChatId unset — deferred; first inbound will auto-populate + announce\n`)
+        process.stderr.write(`daemon: terminal session=${session_id} registered but hubChatId unset — deferred; first inbound will auto-populate + bridge-hint\n`)
       }
     }
-    // Inject the triggering message into the spawned tmux pane as typed user
-    // input. Claude Code's welcome screen swallows MCP channel notifications
-    // sent before first interaction, so pushing through the socket (the normal
-    // path used for mid-session inbound messages) does nothing at startup.
-    // `tmux send-keys` simulates the user typing the prompt into the terminal,
-    // which reliably kicks Claude off the welcome screen AND triggers auto-
-    // processing. The 5s delay gives Claude time to finish booting past the
-    // welcome splash. The content is wrapped in the same <channel source="feishu">
-    // tag Claude Code normally renders for channel notifications, so Claude
-    // knows the chat_id/thread_id etc. when it calls the reply tool.
-    // Fires only once per session; reconnect of the same session_id finds no
-    // entry and no-ops.
+    // Drain pendingFeishuInbound: resumeSession stages an entry here so the
+    // respawned shim's register triggers send-keys of the user's message
+    // that needed a resume. Fresh spawnFeishu no longer uses this path
+    // (send-keys is fired directly from spawnFeishu's setTimeout).
     const pending = this.pendingFeishuInbound.get(session_id)
     if (pending) {
       this.pendingFeishuInbound.delete(session_id)
-      const m = pending.meta as SendKeysMeta
-      const wrapped = wrapForSendKeys(m, pending.content)
-      const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
-      const windowName = `fb:${session_id.slice(0, 8)}`
-      setTimeout(async () => {
-        try {
-          const { spawn } = await import("child_process")
-          const target = `${tmuxSession}:${windowName}`
-          // Use -l (literal) for the text payload so tmux doesn't interpret
-          // any char (like $, backticks) as a keybinding. Then split off Enter
-          // into a second send-keys call with a short gap — Claude Code's
-          // input reader drops the Enter if it arrives in the same burst as
-          // the tail of the text.
-          spawn("tmux", ["send-keys", "-t", target, "-l", wrapped], { stdio: "ignore" }).unref()
-          setTimeout(() => {
-            spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" }).unref()
-          }, 300)
-          process.stderr.write(`daemon: injected feishu-spawn initial into tmux window ${windowName}\n`)
-        } catch (err) {
-          process.stderr.write(`daemon: feishu-spawn tmux send-keys failed: ${err}\n`)
-        }
-      }, 5000)
+      this.scheduleFeishuSendKeys(session_id, pending.windowName, pending.content, pending.meta)
     }
   }
 
-  private sendTerminalAnnounce(session_id: string, hub: string, cwd: string): void {
+  // Truncate to a reasonable single-line title for the announce root. Feishu
+  // renders the whole markdown block, but a multi-paragraph prompt as a
+  // title is unreadable in the thread list.
+  private titleFromPrompt(prompt: string): string {
+    const firstLine = prompt.split("\n")[0]?.trim() ?? ""
+    const collapsed = firstLine.replace(/\s+/g, " ")
+    if (collapsed.length > 200) return collapsed.slice(0, 200).trimEnd() + "…"
+    return collapsed || "Claude Code session online"
+  }
+
+  private sendTerminalAnnounce(session_id: string, hub: string, cwd: string, title: string): void {
     if (!this.cfg.feishuApi) return
     // Markdown format so the blockquote for cwd / session renders cleanly in
     // the feishu chat UI. Rendering falls back to plain text on clients that
     // don't support feishu post-md, and the source is still readable either way.
     const text = [
-      `🟢 Claude Code session online`,
+      `🟢 ${title}`,
       `> cwd: \`${cwd}\``,
       `> session: \`${session_id}\``,
     ].join("\n")
@@ -348,60 +406,129 @@ export class Daemon {
       const entry = { chat_id: hub, root_message_id: res.message_id }
       this.pendingRoots.set(session_id, entry)
       this.persistPendingRoot(session_id, { ...entry, cwd })
-      process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id}\n`)
-      // Push a hint inbound to the shim so Claude knows it's bridged and
-      // which chat_id to post updates to. Without this hint, terminal
-      // Claude has no idea the session should mirror progress to Feishu —
-      // the default MCP instructions are written for the feishu-spawn case
-      // ("sender reads Feishu, not this session"), which is literally wrong
-      // for terminal-origin where the user IS at the terminal. The hint
-      // gets routed through the existing push:inbound → shim → MCP channel
-      // notification path, so Claude processes it exactly like any other
-      // <channel> message and picks up chat_id for subsequent reply calls.
-      // Delay the hint so Claude's MCP handshake + welcome-screen
-      // processing has time to complete. Channel notifications delivered
-      // during MCP init get swallowed the same way the feishu-spawn initial
-      // prompt does (that's why feishu-spawn uses tmux send-keys with 5s
-      // delay); we don't own the terminal pane here, so we stick with MCP
-      // push but push late enough that Claude is actually listening.
-      // Tests override to 0 via config.
-      const hintDelay = this.cfg.bridgeHintDelayMs ?? 5000
-      setTimeout(() => {
-        const entry = this.state.get(session_id)
-        if (!entry) {
-          process.stderr.write(`daemon: bridge-hint SKIPPED session=${session_id} (shim no longer registered after 5s)\n`)
-          return
-        }
-        try {
-          entry.conn.write(frame({
-            push: "inbound",
-            content:
-              "⚡ FEISHU BRIDGE — this Claude session is mirroring to a Feishu group. " +
-              "IMPORTANT: after each meaningful milestone (task start, key finding, " +
-              "blocker, completion), you MUST call the feishu `reply` tool with " +
-              `chat_id="${hub}" and a concise one-paragraph summary. Remote observers ` +
-              "only see what you post via `reply` — your transcript does not reach them. " +
-              "Skip trivia; don't narrate every bash call. Aim for 3-6 updates per task.",
-            meta: {
-              chat_id: hub,
-              initial: "true",
-              source: "feishu-bridge-hint",
-            },
-          }))
-          process.stderr.write(`daemon: bridge-hint pushed to session=${session_id}\n`)
-        } catch (e) {
-          process.stderr.write(`daemon: bridge-hint push FAILED session=${session_id}: ${e}\n`)
-        }
-      }, hintDelay)
+      process.stderr.write(`daemon: terminal auto-announce session=${session_id} hub=${hub} msg=${res.message_id} title="${title.slice(0, 60)}"\n`)
     }).catch((e) => process.stderr.write(`daemon: terminal auto-announce failed: ${e}\n`))
+  }
+
+  private scheduleBridgeHint(session_id: string, hub: string): void {
+    // Delay so Claude's MCP handshake + welcome-screen processing has time
+    // to complete. Channel notifications delivered during MCP init get
+    // swallowed (same reason feishu-spawn uses tmux send-keys with 5s delay).
+    // Tests override via bridgeHintDelayMs.
+    const hintDelay = this.cfg.bridgeHintDelayMs ?? 5000
+    setTimeout(() => {
+      const entry = this.state.get(session_id)
+      if (!entry) {
+        process.stderr.write(`daemon: bridge-hint SKIPPED session=${session_id} (shim no longer registered after ${hintDelay}ms)\n`)
+        return
+      }
+      try {
+        entry.conn.write(frame({
+          push: "inbound",
+          content:
+            "⚡ FEISHU BRIDGE — this Claude session is mirroring to a Feishu group. " +
+            "IMPORTANT: after each meaningful milestone (task start, key finding, " +
+            "blocker, completion), you MUST call the feishu `reply` tool with " +
+            `chat_id="${hub}" and a concise one-paragraph summary. Remote observers ` +
+            "only see what you post via `reply` — your transcript does not reach them. " +
+            "Skip trivia; don't narrate every bash call. Aim for 3-6 updates per task.",
+          meta: {
+            chat_id: hub,
+            initial: "true",
+            source: "feishu-bridge-hint",
+          },
+        }))
+        process.stderr.write(`daemon: bridge-hint pushed to session=${session_id}\n`)
+      } catch (e) {
+        process.stderr.write(`daemon: bridge-hint push FAILED session=${session_id}: ${e}\n`)
+      }
+    }, hintDelay)
   }
 
   private announceDeferredTerminalSessions(hub: string): void {
     if (this.deferredTerminalAnnounce.size === 0) return
-    for (const [session_id, info] of this.deferredTerminalAnnounce) {
-      this.sendTerminalAnnounce(session_id, hub, info.cwd)
+    // Hub just became known. We can't fabricate a user-prompt title for these
+    // sessions (their first prompt may already have been submitted while hub
+    // was unset), so fall back to the pre-prompt announce and let operators
+    // see the generic root. The title will stay generic for these only.
+    for (const [session_id] of this.deferredTerminalAnnounce) {
+      this.scheduleBridgeHint(session_id, hub)
     }
     this.deferredTerminalAnnounce.clear()
+  }
+
+  private handleUserPrompt(conn: Socket, msg: Extract<ShimReq, { op: "user_prompt" }>): void {
+    // Fire-and-forget: hook scripts don't wait for a response, but we still
+    // write one so sendFrame's 2s wait can resolve early.
+    try { conn.write(frame({ id: msg.id, ok: true })) } catch {}
+
+    const uuid = msg.claude_session_uuid
+    const cwd = msg.cwd
+    if (!cwd) return
+    if (this.isIgnoredCwd(cwd)) return
+    if (!this.cfg.feishuApi) return
+    // Defense in depth: the hook already filters channel-wrapped prompts and
+    // the bridge-hint, but one stray variant (seen in the wild:
+    // `<channel source="plugin:feishu:feishu" ...>`) leaked past an
+    // over-narrow earlier filter and became a thread title. Re-check here so
+    // a broken hook can never poison the announce title again.
+    const p = msg.prompt.trimStart()
+    if (p.startsWith("<channel") || p.startsWith("⚡ FEISHU BRIDGE")) {
+      process.stderr.write(`daemon: user_prompt suppressed (channel/bridge-hint echo) cwd=${cwd}\n`)
+      return
+    }
+    // Real user prompt = turn boundary. Reset the per-turn reply counter so
+    // the Stop hook can decide whether its mirror is redundant for THIS turn.
+    if (uuid) this.turnReplyCounts.delete(uuid)
+
+    // Find the session this prompt belongs to. The hook ships the Claude-side
+    // session UUID; shims register either with that same UUID or with a ULID
+    // fallback. Prefer UUID match, then cwd match on pendingRoots, then
+    // thread binding.
+    const byUuidThread = uuid ? findBySessionId(this.threads, uuid) : undefined
+    const byUuidPending = uuid ? this.pendingRoots.has(uuid) : false
+    const byUuidFeishuRoot = uuid ? this.pendingFeishuRoots.has(uuid) : false
+    if (byUuidThread || byUuidPending || byUuidFeishuRoot) {
+      // Session already has a binding somewhere — announce already done (or
+      // feishu-spawn owns the root). Subsequent prompts are no-ops.
+      return
+    }
+    // UUID isn't bound. If the shim registered under a different id (ULID
+    // fallback because jsonl probe timed out), we fall back to matching the
+    // session by cwd via the state registry — same cwd + same-ish timing
+    // window. Pick the most-recently-registered terminal session in this cwd
+    // that has no thread/pendingRoot/feishuRoot yet.
+    const target = this.state.findNewestTerminalForCwd(cwd)
+    if (!target) {
+      // No shim registered yet for this cwd — park the prompt so the next
+      // handleRegister (probably seconds away; shim is probing UUID) can
+      // fire the announce with this prompt as the title.
+      //
+      // Manual-start race: when the user runs `claude` from a terminal, the
+      // shim's UUID probe (default 30s) can elapse while the user is typing
+      // additional prompts. The original user intent is the FIRST prompt
+      // they submitted, not whichever one happened to land last before the
+      // shim came online. Keep the first; ignore later submissions during
+      // the same startup window.
+      const existing = this.pendingUserPrompts.get(cwd)
+      const now = Date.now()
+      if (existing && now - existing.ts < PENDING_PROMPT_TTL_MS) {
+        process.stderr.write(`daemon: user_prompt skipped (cwd=${cwd}) — earlier prompt still buffered as title candidate\n`)
+        return
+      }
+      this.pendingUserPrompts.set(cwd, { prompt: msg.prompt, ts: now })
+      process.stderr.write(`daemon: user_prompt buffered (no live shim yet for cwd=${cwd}, uuid=${uuid})\n`)
+      return
+    }
+    if (findBySessionId(this.threads, target.session_id)) return
+    if (this.pendingRoots.has(target.session_id)) return
+    if (this.pendingFeishuRoots.has(target.session_id)) return
+
+    const hub = loadAccess(this.accessFile).hubChatId
+    if (!hub) return
+
+    const title = this.titleFromPrompt(msg.prompt)
+    this.sendTerminalAnnounce(target.session_id, hub, cwd, title)
   }
 
   private async handleReply(conn: Socket, msg: ReplyReq): Promise<void> {
@@ -414,10 +541,14 @@ export class Daemon {
       try { conn.write(frame({ id: msg.id, ok: false, error: "session not registered" })) } catch {}
       return
     }
-    const format = msg.format ?? "text"
+    const format = msg.format ?? "markdown"
     const bound = findBySessionId(this.threads, entry.session_id)
     const pending = this.pendingRoots.get(entry.session_id)
     const feishuRoot = this.pendingFeishuRoots.get(entry.session_id)
+    // Mark this turn as having had a reply call. Stop hook will see the
+    // counter > 0 and skip its mirror so feishu doesn't get a near-duplicate
+    // of Claude's actual reply text right after Claude's reply tool call.
+    this.turnReplyCounts.set(entry.session_id, (this.turnReplyCounts.get(entry.session_id) ?? 0) + 1)
 
     try {
       if (!bound && !pending && feishuRoot) {
@@ -514,7 +645,7 @@ export class Daemon {
       return
     }
     try {
-      await this.cfg.feishuApi.edit({ message_id: msg.message_id, text: msg.text, format: msg.format ?? "text" })
+      await this.cfg.feishuApi.edit({ message_id: msg.message_id, text: msg.text, format: msg.format ?? "markdown" })
       conn.write(frame({ id: msg.id, ok: true }))
     } catch (err) {
       try { conn.write(frame({ id: msg.id, ok: false, error: (err as Error).message })) } catch {}
@@ -588,11 +719,19 @@ export class Daemon {
       return
     }
     const uuid = msg.claude_session_uuid
-    let thread: ThreadRecord & { thread_id: string } | undefined
-    if (uuid) thread = findBySessionId(this.threads, uuid)
-    if (!thread) {
-      const byCwd = findRecentTerminalThreadForCwd(this.threads, msg.cwd)
-      if (byCwd) thread = byCwd
+    const thread: ThreadRecord & { thread_id: string } | undefined =
+      uuid ? findBySessionId(this.threads, uuid) : undefined
+    // If Claude already called the `reply` MCP tool during this turn, the
+    // Stop hook's mirror would just duplicate Claude's reply content (the
+    // hook captures the assistant's final text — typically a "Reply sent"
+    // / "已回复" follow-up after the tool call). Skip and ack so the shim
+    // doesn't see this as an error.
+    const replies = uuid ? (this.turnReplyCounts.get(uuid) ?? 0) : 0
+    if (uuid) this.turnReplyCounts.delete(uuid)
+    if (replies > 0) {
+      process.stderr.write(`daemon: hook_post mirror skipped — session ${uuid} called reply ${replies}x this turn\n`)
+      try { conn.write(frame({ id: msg.id, ok: true, skipped: "reply-fired" })) } catch {}
+      return
     }
     try {
       if (thread && thread.status !== "closed") {
@@ -609,27 +748,12 @@ export class Daemon {
         return
       }
       // Session hasn't produced a thread binding yet — it's still in
-      // pendingRoots (announced but no MCP reply yet). Post as a threaded
-      // reply off the announce root; that becomes the thread seed.
-      //
-      // First try uuid-keyed lookup; if that misses (the very common
-      // "shim registered under a ULID because it couldn't resolve the
-      // jsonl in time, but Stop-hook has the real UUID" case), fall back
-      // to finding the pending root by cwd match.
-      let pending = uuid ? this.pendingRoots.get(uuid) : undefined
-      let pendingSessionId = uuid
-      if (!pending) {
-        const byCwd = findRecentPendingRootForCwd(this.threads, msg.cwd)
-        if (byCwd) {
-          pending = this.pendingRoots.get(byCwd.session_id) ?? {
-            chat_id: byCwd.root.chat_id,
-            root_message_id: byCwd.root.root_message_id,
-          }
-          pendingSessionId = byCwd.session_id
-          process.stderr.write(`daemon: hook_post cwd-fallback matched session=${pendingSessionId} for uuid=${uuid}\n`)
-        }
-      }
-      if (pending && pendingSessionId) {
+      // pendingRoots (announce posted but no MCP reply yet). Post the hook
+      // text as a threaded reply off the announce root; that seeds the
+      // thread. Because every map is keyed by the real UUID now, direct
+      // lookup by uuid is the only path — no cwd-fallback needed.
+      const pending = uuid ? this.pendingRoots.get(uuid) : undefined
+      if (pending && uuid) {
         const res = await this.cfg.feishuApi.sendInThread({
           root_message_id: pending.root_message_id,
           text: msg.text,
@@ -637,24 +761,18 @@ export class Daemon {
           seed_thread: true,
         })
         if (res.thread_id) {
-          // Bind under Claude's real UUID (what future hooks will use) so
-          // session-id routing works from now on.
           upsertThread(this.threads, res.thread_id, {
-            session_id: uuid || pendingSessionId,
+            session_id: uuid,
             chat_id: pending.chat_id,
             root_message_id: pending.root_message_id,
             cwd: msg.cwd,
             origin: "terminal", status: "active",
             last_active_at: Date.now(), last_message_at: Date.now(),
           })
-          // Clear BOTH keys: the uuid key (if any), and the ULID key the
-          // shim registered under (pendingSessionId might be ≠ uuid).
           this.pendingRoots.delete(uuid)
-          this.pendingRoots.delete(pendingSessionId)
           this.clearPendingRoot(uuid)
-          this.clearPendingRoot(pendingSessionId)
           saveThreads(this.threadsFile, this.threads)
-          process.stderr.write(`daemon: hook_post seeded thread=${res.thread_id} (uuid=${uuid}, shim-session=${pendingSessionId})\n`)
+          process.stderr.write(`daemon: hook_post seeded thread=${res.thread_id} session=${uuid}\n`)
         }
         conn.write(frame({ id: msg.id, ok: true }))
         return
@@ -820,20 +938,23 @@ export class Daemon {
           // consistently drop round-2+ inbound during multi-turn testing.
           // send-keys simulates user input, which reliably kicks Claude's
           // input loop.
+          //
+          // Window name comes from the SessionEntry (shim reported it from
+          // $TMUX_PANE at register time). Don't recompute from session_id —
+          // that broke fresh feishu-spawn, where the pane name is random
+          // because Claude's UUID isn't known at spawn time.
+          const windowName = entry.tmux_window_name
+          if (!windowName) {
+            process.stderr.write(`daemon: send-keys inbound DROPPED — session ${rec.session_id} has no tmux_window_name (thread ${thread_id})\n`)
+            if (this.cfg.feishuApi) {
+              this.cfg.feishuApi.reactTo(event.message.message_id, "CrossMark").catch(() => {})
+            }
+            return
+          }
           const wrapped = wrapForSendKeys(inboundMeta as SendKeysMeta, text)
           const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
-          const windowName = `fb:${rec.session_id.slice(0, 8)}`
           const target = `${tmuxSession}:${windowName}`
-          try {
-            const { spawn } = await import("child_process")
-            spawn("tmux", ["send-keys", "-t", target, "-l", wrapped], { stdio: "ignore" }).unref()
-            setTimeout(() => {
-              spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" }).unref()
-            }, 300)
-            process.stderr.write(`daemon: send-keys inbound to ${target} (thread ${thread_id})\n`)
-          } catch (err) {
-            process.stderr.write(`daemon: send-keys inbound FAILED for ${target}: ${err}\n`)
-          }
+          await this.tmuxSendKeysWithEnter(target, wrapped, `inbound thread=${thread_id}`)
           return
         }
 
@@ -868,60 +989,71 @@ export class Daemon {
   }
 
   // Pending triggering-event payloads to be pushed to shim once it registers.
-  // Keyed by session_id. Deleted on first firing.
-  private pendingFeishuInbound = new Map<string, { content: string; meta: Record<string, unknown> }>()
+  // Keyed by session_id (real Claude UUID). Deleted after send-keys fires.
+  private pendingFeishuInbound = new Map<string, { content: string; meta: Record<string, unknown>; windowName: string }>()
+  // In-flight feishu-spawn intents — keyed by cwd so handleRegister can
+  // recognize a registering shim as feishu-spawn even when daemon's jsonl
+  // UUID poll hasn't completed yet (they run in parallel; shim often
+  // registers milliseconds before daemon's poll ticks). Without this the
+  // session gets misclassified as terminal-origin → bridge-hint fires →
+  // we pollute a feishu-spawn session with hub mirroring.
+  private pendingFeishuSpawns = new Map<string, {
+    event: FeishuEvent
+    preExistingThreadId?: string
+    windowName: string
+    prompt: string
+    attachment: ReturnType<typeof extractTextAndAttachment>["attachment"]
+    startedAt: number
+  }>()
 
   private async spawnFeishu(event: FeishuEvent, preExistingThreadId?: string): Promise<void> {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
-    const cwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
-    const session_id = ulid()
-    // Use extractTextAndAttachment so we handle post/text/interactive/etc
-    // (the naive JSON.parse(content).text only works for plain text msgs).
+    const rawCwd = this.cfg.defaultCwd ?? process.env.FEISHU_DEFAULT_CWD ?? `${process.env.HOME}/workspace`
+    // Canonicalize: claude's jsonl goes under a slug derived from its ACTUAL
+    // cwd (from /proc/self/cwd, i.e. the physical path). Without realpath,
+    // a symlink cwd like `/home/xiaolong -> /data00/home/xiaolong` would
+    // yield a slug that doesn't match claude's, and the shim's UUID probe
+    // would fail.
+    const { realpathSync } = await import("fs")
+    let cwd = rawCwd
+    try { cwd = realpathSync(rawCwd) } catch { /* keep rawCwd as-is */ }
     const { text: prompt, attachment } = extractTextAndAttachment(event)
+    // Window name carries the prompt's first 5 chars for at-a-glance
+    // identification in `tmux list-windows` (otherwise every fb: window looks
+    // like an opaque random string). The trailing random suffix preserves
+    // uniqueness across concurrent spawns of the same prompt.
+    const slug = tmuxNameSlug(prompt, 5)
+    const rand = Math.random().toString(36).slice(2, 8)
+    const windowName = slug ? `fb:${slug}-${rand}` : `fb:${rand}`
 
-    // Stash the triggering event as an inbound push the shim will deliver once
-    // Claude's MCP handshake finishes. Carries the full meta (chat_id, etc.)
-    // that Claude needs to call `reply` correctly.
-    this.pendingFeishuInbound.set(session_id, {
-      content: prompt,
-      meta: {
-        chat_id: event.message.chat_id,
-        message_id: event.message.message_id,
-        thread_id: event.message.thread_id,
-        user: event.sender.sender_id?.open_id ?? "",
-        user_id: event.sender.sender_id?.open_id ?? "",
-        ts: new Date(Number(event.message.create_time)).toISOString(),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_key: attachment.file_key,
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
+    // Flow reality: Claude Code does NOT write the session jsonl until the
+    // FIRST user prompt lands in the session (MCP init alone doesn't
+    // trigger it; we verified empirically that a fresh idle `claude` writes
+    // nothing for >5s). So UUID resolution is unavoidably downstream of
+    // send-keys: we need to push the prompt into the pane to make claude
+    // write jsonl, at which point the shim's probe finds it and registers.
+    // That means daemon cannot poll for UUID BEFORE sending the prompt,
+    // contrary to the earlier "poll first, then inject" design.
+    //
+    // Working sequence:
+    //   1. Mark pendingFeishuSpawns[cwd] so handleRegister knows this
+    //      incoming shim is feishu-origin even before UUID-specific
+    //      binding exists.
+    //   2. Spawn tmux.
+    //   3. After 5s (claude past welcome screen), send-keys the prompt.
+    //   4. Claude processes → jsonl written → shim's 10s probe finds it →
+    //      shim registers with the real UUID → handleRegister finalizes
+    //      the thread binding (feishu-spawn branch, using cwd lookup).
+    this.pendingFeishuSpawns.set(cwd, {
+      event, preExistingThreadId, windowName, prompt, attachment, startedAt: Date.now(),
     })
-
-    if (preExistingThreadId) {
-      // Topic-group trigger: thread already exists (Feishu auto-created it when
-      // the root message was posted). Bind the session to it immediately so the
-      // first reply uses seed_thread:false on the existing thread.
-      upsertThread(this.threads, preExistingThreadId, {
-        session_id, chat_id: event.message.chat_id,
-        root_message_id: event.message.message_id, cwd,
-        origin: "feishu", status: "active",
-        last_active_at: Date.now(), last_message_at: Date.now(),
-      })
-      saveThreads(this.threadsFile, this.threads)
-    } else {
-      this.pendingFeishuRoots.set(session_id, {
-        chat_id: event.message.chat_id,
-        root_message_id: event.message.message_id,
-      })
-    }
 
     if (!this.cfg.spawnOverride) await ensureTmuxSession(tmux)
     const cmd = buildSpawnCommand({
-      session_id, cwd, initial_prompt: prompt, tmux_session: tmux, kind: "feishu",
+      cwd, initial_prompt: prompt, tmux_session: tmux, kind: "feishu",
+      window_name: windowName,
     })
-    process.stderr.write(`daemon: spawnFeishu session=${session_id} cwd=${cwd}\n`)
+    process.stderr.write(`daemon: spawnFeishu cwd=${cwd} window=${windowName}\n`)
     if (this.cfg.spawnOverride) {
       await this.cfg.spawnOverride(cmd.argv, cmd.env)
     } else {
@@ -932,6 +1064,111 @@ export class Daemon {
       child.on("exit", (code) => process.stderr.write(`daemon: spawn exit code=${code}\n`))
       child.unref()
     }
+
+    // Send-keys the triggering prompt after a short delay so claude's
+    // welcome screen has resolved. Tests override to zero via spawnOverride.
+    const inboundMeta = this.buildInboundMeta(event, attachment)
+    const delay = this.cfg.spawnOverride ? 0 : 5000
+    setTimeout(() => this.sendKeysIntoPane(windowName, prompt, inboundMeta), delay)
+
+    // Give up on this spawn if shim never registers (claude crashed,
+    // jsonl-write wedged, etc.). Acts as the "UUID not resolvable" error
+    // path the user asked for — we react ❌ and reply in-thread.
+    const giveUpMs = Number(process.env.FEISHU_SPAWN_REGISTER_TIMEOUT_MS ?? "30000")
+    setTimeout(() => {
+      const entry = this.pendingFeishuSpawns.get(cwd)
+      if (!entry || entry.startedAt >= Date.now() - giveUpMs + 100) return // superseded
+      this.pendingFeishuSpawns.delete(cwd)
+      process.stderr.write(`daemon: spawnFeishu REGISTER TIMEOUT cwd=${cwd} after ${giveUpMs}ms\n`)
+      if (this.cfg.feishuApi) {
+        const trigger = event.message.message_id
+        this.cfg.feishuApi.reactTo(trigger, "CrossMark").catch(() => {})
+        this.cfg.feishuApi.sendInThread({
+          root_message_id: trigger,
+          text: `❌ Failed to start claude session in \`${cwd}\` — shim never registered within ${giveUpMs}ms. Check daemon logs.`,
+          format: "markdown", seed_thread: !preExistingThreadId,
+        }).catch(() => {})
+      }
+    }, giveUpMs)
+  }
+
+  private buildInboundMeta(event: FeishuEvent, attachment: ReturnType<typeof extractTextAndAttachment>["attachment"]): Record<string, unknown> {
+    return {
+      chat_id: event.message.chat_id,
+      message_id: event.message.message_id,
+      thread_id: event.message.thread_id,
+      user: event.sender.sender_id?.open_id ?? "",
+      user_id: event.sender.sender_id?.open_id ?? "",
+      ts: new Date(Number(event.message.create_time)).toISOString(),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_key: attachment.file_key,
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
+    }
+  }
+
+  // Fire-and-forget tmux send-keys that still surfaces failures. Hooks an
+  // exit listener so "can't find window" / non-zero exit gets logged instead
+  // of silently dropping the inbound (the bug that hid the original window-
+  // name routing mismatch for so long). Returns a promise that resolves once
+  // both the literal payload and the trailing Enter have been queued.
+  private async tmuxSendKeysWithEnter(target: string, payload: string, ctx: string): Promise<void> {
+    try {
+      const { spawn } = await import("child_process")
+      const literal = spawn("tmux", ["send-keys", "-t", target, "-l", payload], { stdio: "ignore" })
+      literal.on("exit", (code) => {
+        if (code !== 0) process.stderr.write(`daemon: send-keys literal FAILED on ${target} exit=${code} (${ctx})\n`)
+      })
+      literal.unref()
+      setTimeout(() => {
+        const enter = spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" })
+        enter.on("exit", (code) => {
+          if (code !== 0) process.stderr.write(`daemon: send-keys Enter FAILED on ${target} exit=${code} (${ctx})\n`)
+        })
+        enter.unref()
+      }, 300)
+      process.stderr.write(`daemon: send-keys to ${target} (${ctx})\n`)
+    } catch (err) {
+      process.stderr.write(`daemon: send-keys threw on ${target} (${ctx}): ${err}\n`)
+    }
+  }
+
+  private async sendKeysIntoPane(windowName: string, content: string, meta: Record<string, unknown>): Promise<void> {
+    const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
+    try {
+      const { spawn } = await import("child_process")
+      const target = `${tmuxSession}:${windowName}`
+      const wrapped = wrapForSendKeys(meta as SendKeysMeta, content)
+      // Two-stage prime: a fresh claude in an un-trusted cwd shows a
+      // "Is this a project you trust?" dialog that eats keystrokes and
+      // swallows the subsequent --dangerously-load-development-channels
+      // experimental-splash too. Sending a priming Enter dismisses any
+      // such dialog (trust default is "Yes, I trust this folder"; splash
+      // dismisses on Enter); then we wait for claude to settle at the
+      // `❯` prompt before sending the real payload.
+      const prime = spawn("tmux", ["send-keys", "-t", target, "Enter"], { stdio: "ignore" })
+      prime.on("exit", (code) => {
+        if (code !== 0) process.stderr.write(`daemon: send-keys prime FAILED on ${target} exit=${code}\n`)
+      })
+      prime.unref()
+      setTimeout(() => this.tmuxSendKeysWithEnter(target, wrapped, `initial window=${windowName}`), 1500)
+      process.stderr.write(`daemon: send-keys into tmux window ${windowName}\n`)
+    } catch (err) {
+      process.stderr.write(`daemon: send-keys failed on ${windowName}: ${err}\n`)
+    }
+  }
+
+  // Extracted from the old handleRegister inline setTimeout — now both
+  // handleRegister (normal order: daemon-poll completes first) and
+  // spawnFeishu (race order: shim-register completes first) can call it.
+  private scheduleFeishuSendKeys(session_id: string, windowName: string, content: string, meta: Record<string, unknown>): void {
+    const tmuxSession = this.cfg.tmuxSession ?? "claude-feishu"
+    setTimeout(() => {
+      const target = `${tmuxSession}:${windowName}`
+      const wrapped = wrapForSendKeys(meta as SendKeysMeta, content)
+      this.tmuxSendKeysWithEnter(target, wrapped, `resume-inbound session=${session_id}`)
+    }, 5000)
   }
 
   private async resumeSession(rec: ThreadRecord, thread_id: string, event: FeishuEvent): Promise<void> {
@@ -956,8 +1193,10 @@ export class Daemon {
     // via tmux send-keys once the respawned shim reconnects — same delivery
     // path as fresh feishu-spawn. Without this, resume would bring up a
     // Claude pane with no idea why and silently drop the user's message.
+    const windowName = `fb:${rec.session_id.slice(0, 8)}`
     this.pendingFeishuInbound.set(rec.session_id, {
       content: prompt,
+      windowName,
       meta: {
         chat_id: event.message.chat_id,
         message_id: event.message.message_id,
@@ -972,10 +1211,16 @@ export class Daemon {
         } : {}),
       },
     })
+    // session_id IS the Claude session UUID now, so use it for both
+    // FEISHU_SESSION_ID env (shim short-circuits its probe) and the
+    // `claude --resume <uuid>` argument. rec.claude_session_uuid is only
+    // kept for backward-compat with older threads.json records.
+    const resumeUuid = rec.claude_session_uuid ?? rec.session_id
     const cmd = buildSpawnCommand({
       session_id: rec.session_id, cwd: rec.cwd, initial_prompt: prompt,
       tmux_session: tmux, kind: "resume",
-      claude_session_uuid: rec.claude_session_uuid,
+      claude_session_uuid: resumeUuid,
+      window_name: windowName,
     })
     if (this.cfg.spawnOverride) {
       await this.cfg.spawnOverride(cmd.argv, cmd.env)

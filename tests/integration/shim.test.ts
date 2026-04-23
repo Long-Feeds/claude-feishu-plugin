@@ -47,42 +47,22 @@ test("shim reconnects and re-registers after daemon restart", async () => {
   await fd2.stop()
 })
 
-test("shim without FEISHU_SESSION_ID persists daemon-assigned id across reconnects", async () => {
-  // Regression: terminal-origin sessions don't have FEISHU_SESSION_ID in env,
-  // so they register with session_id=null. Daemon assigns a ULID on first
-  // register. On daemon restart, shim must re-use that ULID — otherwise
-  // daemon sees null again, treats the reconnect as a fresh terminal
-  // registration, and fires a duplicate `🟢 session online` announce.
+test("shim with FEISHU_SESSION_ID (resume-spawn env) persists that id across reconnects", async () => {
+  // Resume-spawn path: daemon already knows the UUID and passes it via env.
+  // Shim uses it directly (no jsonl probe), and must re-use the same id on
+  // reconnect so daemon's handleRegister hits alreadyBound and doesn't
+  // re-announce.
   const dir = mkdtempSync(join(tmpdir(), "shim-test-"))
   const sock = join(dir, "daemon.sock")
-  const ASSIGNED = "01ASSIGNEDBYDAEMON"
+  const PRESET = "66666666-6666-4666-8666-666666666666"
 
-  // Custom fake-daemon that echoes a fixed ULID when session_id is null,
-  // so we can assert the shim reuses it on reconnect.
-  const fd1 = new FakeDaemon(sock)
-  fd1.onMsg = function (msg: any) {
-    this.received.push(msg)
-    if (msg.op === "register") {
-      this.conn.write(
-        JSON.stringify({
-          id: msg.id, ok: true,
-          session_id: msg.session_id ?? ASSIGNED,
-          thread_id: null,
-        }) + "\n",
-      )
-    }
-  }
-  await fd1.start()
-
+  const fd1 = new FakeDaemon(sock); await fd1.start()
   const env = {
     ...process.env,
     FEISHU_DAEMON_SOCKET: sock,
-    // Tests run inside a real claude process; without this, the shim's
-    // /proc walk would find our test-runner's claude ancestor and report
-    // THAT jsonl's UUID instead of null.
+    FEISHU_SESSION_ID: PRESET,
     FEISHU_SHIM_SKIP_UUID_PROBE: "1",
   } as any
-  delete env.FEISHU_SESSION_ID
   const shim = spawn("bun", ["src/shim.ts"], { env, stdio: ["pipe", "pipe", "inherit"] })
   shim.stdin.write(JSON.stringify({
     jsonrpc: "2.0", id: 1, method: "initialize",
@@ -90,7 +70,7 @@ test("shim without FEISHU_SESSION_ID persists daemon-assigned id across reconnec
   }) + "\n")
   await new Promise((r) => setTimeout(r, 400))
   const firstRegister = fd1.received.find((m) => m.op === "register")
-  expect(firstRegister?.session_id ?? null).toBeNull()
+  expect(firstRegister?.session_id).toBe(PRESET)
 
   await fd1.stop()
   await new Promise((r) => setTimeout(r, 200))
@@ -98,7 +78,7 @@ test("shim without FEISHU_SESSION_ID persists daemon-assigned id across reconnec
   const fd2 = new FakeDaemon(sock); await fd2.start()
   await new Promise((r) => setTimeout(r, 3000))
   const reRegister = fd2.received.find((m) => m.op === "register")
-  expect(reRegister?.session_id).toBe(ASSIGNED)
+  expect(reRegister?.session_id).toBe(PRESET)
 
   shim.kill()
   await fd2.stop()
