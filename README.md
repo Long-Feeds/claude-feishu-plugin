@@ -8,7 +8,7 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
 
 - [Bun](https://bun.sh/) on `PATH` (runtime for both daemon and shim)
 - `tmux` on `PATH` (daemon spawns new Claude sessions as tmux windows)
-- systemd `--user` (Linux). macOS via launchd is future work.
+- A user-session service manager — systemd `--user` on Linux, launchd on macOS (user-agent, `~/Library/LaunchAgents`). `/feishu:configure install-service` picks the right one via `uname -s`.
 
 ## Architecture
 
@@ -20,7 +20,7 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
                                    │ im.message.receive_v1 (WSS)
                                    ▼
     ┌─────────────────────────────────────────────────────────────┐
-    │  claude-feishu-daemon    (systemd --user service)           │
+    │  claude-feishu-daemon    (systemd --user / launchd agent)   │
     │                                                             │
     │   WSClient  ─▶  gate (access.json)  ─▶  router              │
     │                                          │                  │
@@ -62,7 +62,7 @@ No public IP or webhook required — uses Feishu's WebSocket long connection.
                      └── inbox/        (downloaded attachments)
 ```
 
-The daemon runs under systemd and is the sole holder of the Feishu WebSocket.
+The daemon runs as a user service (systemd `--user` on Linux, launchd user-agent on macOS) and is the sole holder of the Feishu WebSocket.
 Each `claude` session loads a thin MCP shim via `.mcp.json`; shims speak NDJSON
 over the daemon's Unix socket and translate MCP tool calls ↔ Feishu actions on
 behalf of their session.
@@ -135,20 +135,23 @@ This saves credentials to `~/.claude/channels/feishu/.env` (chmod 600).
 2. In Claude Code: `/feishu:access pair <code>`
 3. The bot confirms pairing. You're connected!
 
-### 5. Install the systemd daemon
+### 5. Install the daemon service
 
 ```
 /feishu:configure install-service
 ```
 
-This writes `~/.config/systemd/user/claude-feishu.service`, enables it, and
-starts the daemon. Verify with:
+This detects your OS and installs the appropriate user-session service:
 
-```bash
-systemctl --user status claude-feishu
-```
+- **Linux** → writes `~/.config/systemd/user/claude-feishu.service` and
+  `systemctl --user enable --now claude-feishu`.
+  Verify: `systemctl --user status claude-feishu`.
+  Live logs: `journalctl --user -u claude-feishu -f`.
 
-Live logs: `journalctl --user -u claude-feishu -f`.
+- **macOS** → writes `~/Library/LaunchAgents/com.claude-feishu.plist` and
+  `launchctl bootstrap gui/$(id -u) ...`.
+  Verify: `launchctl print gui/$(id -u)/com.claude-feishu | head`.
+  Live logs: `tail -f ~/.claude/channels/feishu/daemon.log`.
 
 ### 6. Launch Claude Code normally
 
@@ -230,10 +233,10 @@ is gone but the thread in Feishu still exists (status=inactive).
 | `/feishu:access thread close <thread_id>` | Archive a thread — replies to it get "thread closed" auto-response |
 | `/feishu:access thread kill <thread_id>` | `tmux kill-window` on the session's window; daemon auto-flips status to inactive |
 | `/feishu:configure set-hub <chat_id>` | Change the hub chat for terminal sessions (first pair auto-sets this) |
-| `/feishu:configure install-service` | (Re)install the systemd user service |
-| `/feishu:configure uninstall-service` | Disable + remove the systemd service |
-| `systemctl --user status claude-feishu` | Check daemon liveness |
-| `journalctl --user -u claude-feishu -f` | Live daemon logs |
+| `/feishu:configure install-service` | (Re)install the user-session service (systemd on Linux, launchd on macOS) |
+| `/feishu:configure uninstall-service` | Disable + remove the service |
+| `systemctl --user status claude-feishu` _(Linux)_ / `launchctl print gui/$(id -u)/com.claude-feishu` _(macOS)_ | Check daemon liveness |
+| `journalctl --user -u claude-feishu -f` _(Linux)_ / `tail -f ~/.claude/channels/feishu/daemon.log` _(macOS)_ | Live daemon logs |
 | `tmux attach -t claude-feishu` | Watch all spawned feishu/resume sessions |
 
 ### Permission requests
