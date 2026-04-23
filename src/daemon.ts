@@ -11,6 +11,7 @@ import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
 import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, pruneInactive, prunePendingRoots, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession, tmuxNameSlug } from "./spawn"
+import { runIdleSweep, sweepIntervalMs } from "./idle-sweep"
 import { extractTextAndAttachment } from "./inbound"
 
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
@@ -206,6 +207,15 @@ export class Daemon {
     if (changed) saveThreads(d.threadsFile, d.threads)
     await d.bindSocket()
     await cfg.wsStart()
+    const sweepMs = sweepIntervalMs(process.env)
+    if (sweepMs > 0) {
+      // 10-minute warmup keeps reconnect storms (bun sync / systemctl
+      // restart) from reading last_message_at as stale for still-live
+      // sessions whose shims are mid-reconnect.
+      const warmupRaw = Number(process.env.FEISHU_IDLE_SWEEP_WARMUP_MS ?? "600000")
+      const initialDelay = Number.isFinite(warmupRaw) && warmupRaw >= 0 ? warmupRaw : 600_000
+      setTimeout(() => d.scheduleIdleSweep(sweepMs), initialDelay).unref()
+    }
     return d
   }
 
@@ -1235,6 +1245,57 @@ export class Daemon {
     this.threads.threads[thread_id]!.status = "active"
     this.threads.threads[thread_id]!.last_active_at = Date.now()
     saveThreads(this.threadsFile, this.threads)
+  }
+
+  private scheduleIdleSweep(delayMs: number): void {
+    setTimeout(async () => {
+      try { await this.runIdleSweepOnce(Date.now()) }
+      catch (err) { process.stderr.write(`daemon: idle sweep threw ${err}\n`) }
+      this.scheduleIdleSweep(delayMs)
+    }, delayMs).unref()
+  }
+
+  // Exposed for tests and for one-shot operator-triggered runs. Never throws.
+  async runIdleSweepOnce(now: number): Promise<{ killed: string[] }> {
+    const idleHoursRaw = Number(process.env.FEISHU_IDLE_KILL_HOURS ?? "24")
+    const idleHours = Number.isFinite(idleHoursRaw) && idleHoursRaw > 0 ? idleHoursRaw : 24
+    const idleMs = idleHours * 3600_000
+    const maxRaw = Number(process.env.FEISHU_IDLE_SWEEP_MAX ?? "20")
+    const max = Number.isFinite(maxRaw) && maxRaw > 0 ? maxRaw : 20
+    const result = await runIdleSweep({
+      threads: this.threads,
+      saveThreads: (s) => saveThreads(this.threadsFile, s),
+      feishuApi: this.cfg.feishuApi,
+      killTmuxWindow: (sess, name) => this.killTmuxWindow(sess, name),
+      daemonState: this.state,
+      tmuxSession: this.cfg.tmuxSession ?? "claude-feishu",
+      now, idleMs, max,
+      log: (msg) => process.stderr.write(`${msg}\n`),
+    })
+    if (result.killed.length > 0) {
+      process.stderr.write(`daemon: idle sweep processed ${result.killed.length} session(s)\n`)
+    }
+    return result
+  }
+
+  // Test-friendly: defers to spawnOverride when present so assertions can
+  // observe the exact tmux command without shelling out.
+  private async killTmuxWindow(session: string, windowName: string): Promise<void> {
+    const argv = ["tmux", "kill-window", "-t", `${session}:${windowName}`]
+    if (this.cfg.spawnOverride) {
+      const code = await this.cfg.spawnOverride(argv, {})
+      if (code !== 0) throw new Error(`kill-window spawnOverride exit=${code}`)
+      return
+    }
+    const { spawn } = await import("child_process")
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(argv[0]!, argv.slice(1), { stdio: "ignore" })
+      child.once("error", reject)
+      child.once("exit", (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`tmux kill-window exit=${code}`))
+      })
+    })
   }
 
   async stop(): Promise<void> {
