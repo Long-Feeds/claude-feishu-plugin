@@ -323,6 +323,7 @@ export class Daemon {
           root_message_id: spawnIntent.event.message.message_id, cwd: msg.cwd,
           origin: "feishu", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
+          ...(msg.tmux_window_name ? { tmux_window_name: msg.tmux_window_name } : {}),
         })
         saveThreads(this.threadsFile, this.threads)
       } else {
@@ -565,6 +566,7 @@ export class Daemon {
           root_message_id: feishuRoot.root_message_id, cwd: entry.cwd,
           origin: "feishu", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
+          ...(entry.tmux_window_name ? { tmux_window_name: entry.tmux_window_name } : {}),
         })
         saveThreads(this.threadsFile, this.threads)
         this.pendingFeishuRoots.delete(entry.session_id)
@@ -600,6 +602,7 @@ export class Daemon {
           root_message_id: pending.root_message_id, cwd: entry.cwd,
           origin: "terminal", status: "active",
           last_active_at: Date.now(), last_message_at: Date.now(),
+          ...(entry.tmux_window_name ? { tmux_window_name: entry.tmux_window_name } : {}),
         })
         this.pendingRoots.delete(entry.session_id)
         this.clearPendingRoot(entry.session_id)   // also removes from disk

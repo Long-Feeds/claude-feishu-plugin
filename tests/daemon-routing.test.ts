@@ -1242,3 +1242,52 @@ test("feishu inbound uses tmux_window_name reported by shim, not derived from se
   s.end()
   await daemon.stop()
 })
+
+test("feishu-spawn register records tmux_window_name in the thread binding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp/dwn-test", tmuxSession: "claude-feishu",
+  })
+
+  // Deliver an event with a thread_id so daemon uses the preExistingThreadId
+  // branch (the only path that writes the thread directly at register time).
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_trigger", chat_id: "oc_test", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi"}', create_time: "0",
+      thread_id: "omt_preexisting",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  // Register a "shim" with a tmux_window_name.
+  const s = connect(sock)
+  await new Promise((r) => s.once("connect", () => r(null)))
+  s.write(frame({
+    op: "register", session_id: "fake-uuid-1234-5678-9abc-def012345678",
+    pid: 1, cwd: "/tmp/dwn-test", tmux_window_name: "fb:hello-xyz123",
+  } as any))
+  await wait(50)
+
+  const { loadThreads: lt } = await import("../src/threads")
+  const store = lt(join(dir, "threads.json"))
+  expect(store.threads["omt_preexisting"]!.tmux_window_name).toBe("fb:hello-xyz123")
+
+  s.destroy()
+  await daemon.stop()
+})
