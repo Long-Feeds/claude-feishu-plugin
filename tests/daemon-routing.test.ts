@@ -1242,3 +1242,119 @@ test("feishu inbound uses tmux_window_name reported by shim, not derived from se
   s.end()
   await daemon.stop()
 })
+
+test("feishu-spawn register records tmux_window_name in the thread binding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp/dwn-test", tmuxSession: "claude-feishu",
+  })
+
+  // Deliver an event with a thread_id so daemon uses the preExistingThreadId
+  // branch (the only path that writes the thread directly at register time).
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_trigger", chat_id: "oc_test", chat_type: "p2p",
+      message_type: "text", content: '{"text":"hi"}', create_time: "0",
+      thread_id: "omt_preexisting",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  // Register a "shim" with a tmux_window_name.
+  const s = connect(sock)
+  await new Promise((r) => s.once("connect", () => r(null)))
+  s.write(frame({
+    op: "register", session_id: "fake-uuid-1234-5678-9abc-def012345678",
+    pid: 1, cwd: "/tmp/dwn-test", tmux_window_name: "fb:hello-xyz123",
+  } as any))
+  await wait(50)
+
+  const { loadThreads: lt } = await import("../src/threads")
+  const store = lt(join(dir, "threads.json"))
+  expect(store.threads["omt_preexisting"]!.tmux_window_name).toBe("fb:hello-xyz123")
+
+  s.destroy()
+  await daemon.stop()
+})
+
+test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const spawnedCmds: string[][] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: {} }),
+        reply: async () => ({ data: { message_id: "m_notif" } }),
+        patch: async () => ({}),
+      },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Pre-seed threads.json with a stale feishu thread and a stale terminal thread.
+  // Terminal thread is seeded as inactive (Daemon.start() would flip active→inactive
+  // at boot anyway; seeding it inactive here keeps the assertion straightforward).
+  const { saveThreads: st } = await import("../src/threads")
+  const now = Date.now()
+  const TWO_DAYS = 2 * 86400_000
+  st(join(dir, "threads.json"), {
+    version: 1,
+    threads: {
+      t_feishu_stale: {
+        session_id: "S_FEISHU", chat_id: "oc_test", root_message_id: "m_root_f",
+        cwd: "/tmp", origin: "feishu", status: "active",
+        last_active_at: now - TWO_DAYS, last_message_at: now - TWO_DAYS,
+        tmux_window_name: "fb:stale-abc",
+      },
+      t_terminal_stale: {
+        session_id: "S_TERM", chat_id: "oc_hub", root_message_id: "m_root_t",
+        cwd: "/tmp", origin: "terminal", status: "inactive",
+        last_active_at: now - TWO_DAYS, last_message_at: now - TWO_DAYS,
+      },
+    },
+    pendingRoots: {},
+  })
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    // Capture tmux commands for assertion instead of running real tmux.
+    spawnOverride: async (argv) => { spawnedCmds.push(argv); return 0 },
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+
+  const result = await daemon.runIdleSweepOnce(now)
+  expect(result.killed).toEqual(["t_feishu_stale"])
+
+  // Assert tmux kill-window captured
+  const killCmd = spawnedCmds.find((a) => a[0] === "tmux" && a[1] === "kill-window")
+  expect(killCmd).toBeDefined()
+  expect(killCmd!.join(" ")).toContain("claude-feishu:fb:stale-abc")
+
+  // Disk: feishu row → inactive; terminal row → untouched (stays inactive)
+  const { loadThreads: lt } = await import("../src/threads")
+  const back = lt(join(dir, "threads.json"))
+  expect(back.threads["t_feishu_stale"]!.status).toBe("inactive")
+  expect(back.threads["t_terminal_stale"]!.status).toBe("inactive")
+
+  await daemon.stop()
+})

@@ -13,6 +13,12 @@ export type ThreadRecord = {
   status: "active" | "inactive" | "closed"
   last_active_at: number
   last_message_at: number
+  // tmux window name owning the claude pane for this thread, reported by
+  // the shim at register time. Recorded here so the idle sweeper can
+  // `tmux kill-window` the correct pane even after the shim has
+  // disconnected (SessionEntry is gone by then). Legacy records without
+  // this field fall back to `fb:<session_id[:8]>` in the sweeper.
+  tmux_window_name?: string
   spawn_env?: Record<string, string>
 }
 

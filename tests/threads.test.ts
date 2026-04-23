@@ -175,3 +175,16 @@ test("markActive does NOT reopen closed threads", () => {
   markActive(store, "S1")
   expect(store.threads["t1"]!.status).toBe("closed")   // still closed
 })
+
+test("ThreadRecord preserves tmux_window_name across save/load", () => {
+  const store = loadThreads(file)
+  upsertThread(store, "t_wn", {
+    session_id: "S_WN", chat_id: "c1", root_message_id: "m1",
+    cwd: "/w", origin: "feishu", status: "active",
+    last_active_at: 1, last_message_at: 1,
+    tmux_window_name: "fb:test-abc123",
+  })
+  saveThreads(file, store)
+  const back = loadThreads(file)
+  expect(back.threads["t_wn"]!.tmux_window_name).toBe("fb:test-abc123")
+})
