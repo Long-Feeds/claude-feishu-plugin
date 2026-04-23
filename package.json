@@ -5,10 +5,14 @@
   "type": "module",
   "bin": "./server.ts",
   "scripts": {
-    "start": "bun install --no-summary && bun server.ts"
+    "start": "bun install --no-summary && bun server.ts",
+    "daemon": "bun install --no-summary && bun src/daemon.ts",
+    "shim": "bun install --no-summary && bun src/shim.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@larksuiteoapi/node-sdk": "^1.56.0"
+    "@larksuiteoapi/node-sdk": "^1.56.0",
+    "ulid": "^2.3.0"
   }
 }
