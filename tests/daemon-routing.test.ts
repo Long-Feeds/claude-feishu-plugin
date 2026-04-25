@@ -1509,6 +1509,12 @@ test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone
     defaultCwd: "/tmp", tmuxSession: "claude-feishu",
   })
 
+  // Daemon.start flips active→inactive at boot. Re-flip the row we want
+  // swept; without this the new selector's skip-inactive filter would
+  // (correctly) ignore it. In production a reconnecting shim would do this
+  // re-flip via handleRegister within the warmup window.
+  ;(daemon as any).threads.threads["t_feishu_stale"].status = "active"
+
   const result = await daemon.runIdleSweepOnce(now)
   expect(result.killed).toEqual(["t_feishu_stale"])
 
@@ -1523,5 +1529,59 @@ test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone
   expect(back.threads["t_feishu_stale"]!.status).toBe("inactive")
   expect(back.threads["t_terminal_stale"]!.status).toBe("inactive")
 
+  await daemon.stop()
+})
+
+// Without this bump, a thread that was already swept (status=inactive,
+// last_message_at very old) gets revived by resumeSession when the user
+// returns — but resumeSession only updates last_active_at. Until Claude
+// finally produces an outbound reply (which can take seconds to minutes),
+// last_message_at stays old. Combined with the selector's 24h staleness
+// check, the very next sweep tick (~12h later) would re-fire the hibernate
+// notice on a thread the user is actively chatting in.
+test("inbound feishu message into a known thread bumps last_message_at", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_revived"] = {
+    session_id: "S_REVIVED", claude_session_uuid: "uuid-revived",
+    chat_id: "oc_dm", root_message_id: "m_root", cwd: "/tmp",
+    origin: "feishu", status: "inactive",
+    last_active_at: 1, last_message_at: 1,  // ancient
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+
+  const before = Date.now()
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_revive", chat_id: "oc_dm", chat_type: "p2p",
+      thread_id: "t_revived",
+      message_type: "text", content: '{"text":"are you there"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  const back = loadThreads(threadsFile)
+  expect(back.threads["t_revived"]!.last_message_at).toBeGreaterThanOrEqual(before)
   await daemon.stop()
 })

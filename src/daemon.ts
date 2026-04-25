@@ -955,6 +955,16 @@ export class Daemon {
         }
         return
       }
+      // Inbound user activity advances the idle clock. Without this, an
+      // already-hibernated thread the user is now reviving stays "stale" by
+      // last_message_at until Claude produces its first outbound reply
+      // (handleReply / hook_post mirror) — a window that can be many seconds
+      // and is not guaranteed (resume could fail). The next sweep tick would
+      // then re-fire the hibernate notice on a thread the user is actively
+      // chatting in. Persisting because saveThreads is the only durable
+      // signal between daemon ticks.
+      this.threads.threads[thread_id]!.last_message_at = Date.now()
+      saveThreads(this.threadsFile, this.threads)
       const entry = this.state.get(rec.session_id)
       process.stderr.write(`daemon: thread ${thread_id} → session ${rec.session_id} → entry ${entry ? "FOUND" : "MISSING"}\n`)
       if (entry) {
