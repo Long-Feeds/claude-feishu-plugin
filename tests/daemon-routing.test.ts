@@ -1796,3 +1796,74 @@ test("inbound feishu message into a known thread bumps last_message_at", async (
   expect(back.threads["t_revived"]!.last_message_at).toBeGreaterThanOrEqual(before)
   await daemon.stop()
 })
+
+// Regression: the daemon's spawn-register watchdog used to default to 30s
+// and started its clock at spawnFeishu time, while the shim's UUID probe
+// (also 30s) started AFTER claude had loaded .mcp.json — typically 3-5s
+// later. On a slow first spawn the daemon would post "shim never registered"
+// in the thread before the shim could possibly finish probing. Default is
+// now 60s so this only fires on genuine failures, but the message
+// formatting and react ❌ side-effects still need to work.
+test("spawnFeishu register-timeout posts diagnostic error and reacts ❌", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const calls: any[] = []
+  const reactions: any[] = []
+  const api = new FeishuApi({
+    im: {
+      message: {
+        create: async () => ({ data: { message_id: "m_top" } }),
+        reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_err", thread_id: "t_err" } } },
+        patch: async () => ({}),
+      },
+      messageReaction: {
+        create: async (a) => { reactions.push(a); return { data: { reaction_id: "r1" } } },
+        delete: async () => ({}),
+      },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  // Force a fast timeout via env so the test doesn't wait 60s.
+  process.env.FEISHU_SPAWN_REGISTER_TIMEOUT_MS = "150"
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    // No-op spawn — no shim ever registers, so the watchdog must fire.
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_trigger", chat_id: "oc_dm", chat_type: "p2p",
+      message_type: "text", content: '{"text":"please run something"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+
+  // Wait past the watchdog deadline.
+  await wait(300)
+
+  const errReply = calls.find((c) => c.op === "reply" && c.a?.path?.message_id === "om_trigger")
+  expect(errReply).toBeDefined()
+  // The error body must mention the user-facing failure AND at least one
+  // diagnostic hint, so operators don't have to grep journalctl to even
+  // know which knob to check.
+  const body = errReply!.a.data.content as string
+  expect(body).toContain("shim never registered")
+  expect(body).toContain("journalctl")
+  // ❌ react on the trigger message so the user sees the failure inline.
+  // (deliverFeishuEvent also fires an OnIt "doing" react before spawn,
+  // so filter for the timeout-specific CrossMark.)
+  const cross = reactions.find(
+    (r) => r?.path?.message_id === "om_trigger" && r?.data?.reaction_type?.emoji_type === "CrossMark",
+  )
+  expect(cross).toBeDefined()
+
+  delete process.env.FEISHU_SPAWN_REGISTER_TIMEOUT_MS
+  await daemon.stop()
+})

@@ -107,6 +107,14 @@ skills/
   下的拷贝，不是 `~/workspace/claude-feishu-plugin/`。本地改完代码要么重装插件，
   要么直接 `bun sync`（见 package.json，做 rsync + restart）。忘记同步会让你盯着
   旧代码的日志排查新代码的 bug。
+- **spawn-register 看门狗 vs shim UUID 探测的预算关系**：daemon 的
+  `FEISHU_SPAWN_REGISTER_TIMEOUT_MS`（默认 60s）从 `spawnFeishu()`
+  起算，shim 的 `FEISHU_SHIM_UUID_PROBE_MS`（默认 30s）从 shim 进程
+  本身启动那一刻起算 —— 两者起跑线相差几秒（claude 加载 .mcp.json +
+  bun 起 shim 的开销）。daemon 默认值必须明显大于 shim 探测窗 + claude
+  冷启动余量，否则在慢启动场景里 daemon 会先于 shim 探测完成就发出
+  "shim never registered" 错误。改 shim 探测时间时记得同步检查 daemon
+  的预算。
 
 ## 开发/调试命令
 
