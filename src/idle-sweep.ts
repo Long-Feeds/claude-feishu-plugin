@@ -28,7 +28,9 @@ export function selectIdleFeishuThreads(
   return out.slice(0, max)
 }
 
-const HIBERNATE_NOTICE = "🛌 会话空闲 24 小时，已休眠。发新消息会自动恢复上下文。"
+// Emoji reaction stamped on the first message of an idle thread instead of
+// posting a text notice. SLEEP matches the original 🛌 hibernate metaphor.
+const HIBERNATE_REACTION = "SLEEP"
 
 export type IdleSweepDeps = {
   threads: ThreadStore
@@ -44,8 +46,8 @@ export type IdleSweepDeps = {
 }
 
 // Execute one sweep tick. Per candidate, in order:
-//   1. Post a hibernate notice in the thread (best-effort; notify failure
-//      must not block kill).
+//   1. React on the thread's first message with the hibernate emoji
+//      (best-effort; notify failure must not block kill).
 //   2. Remove the in-memory SessionEntry so any concurrent inbound routes
 //      to `resumeSession` rather than send-keysing a dying pane.
 //   3. tmux kill-window — kill-window failure must not block the state
@@ -60,12 +62,7 @@ export async function runIdleSweep(deps: IdleSweepDeps): Promise<{ killed: strin
 
     if (deps.feishuApi) {
       try {
-        await deps.feishuApi.sendInThread({
-          root_message_id: t.root_message_id,
-          text: HIBERNATE_NOTICE,
-          format: "markdown",
-          seed_thread: false,
-        })
+        await deps.feishuApi.reactTo(t.root_message_id, HIBERNATE_REACTION)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         deps.log(`idle-sweep: notify failed for thread=${t.thread_id}: ${msg}`)
