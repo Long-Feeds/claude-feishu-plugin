@@ -1430,9 +1430,31 @@ test("feishu inbound uses tmux_window_name reported by shim, not derived from se
   await daemon.stop()
 })
 
-test("feishu-spawn register records tmux_window_name in the thread binding", async () => {
+test("pendingFeishuSpawns is NOT hijacked by a stale shim registering in the same cwd with a different window_name", async () => {
+  // Regression for the "Tesla topic posted as a new root message" bug.
+  //
+  // Setup that triggered it in the wild:
+  //   * A prior claude in /workspace is still alive. Its shim is stuck in a
+  //     reconnect loop (two shims collided on the same session_id earlier,
+  //     and DaemonState.register's unconditional prev.conn.destroy() turned
+  //     the collision into a 10ms-period re-register storm).
+  //   * A fresh feishu message arrives → spawnFeishu parks an intent keyed by
+  //     cwd so handleRegister can bind the NEW shim's UUID to the new thread.
+  //   * Between the intent being parked and the new shim registering, one of
+  //     the storm reconnects fires handleRegister. The old shim's cwd matches
+  //     the intent's cwd, so it drains the intent and binds the NEW feishu
+  //     thread to the OLD session. The real new shim arrives to a drained
+  //     intent → gets treated as a terminal session → its first `reply`
+  //     falls through to sendRoot → a new topic appears instead of a
+  //     thread reply.
+  //
+  // Fix: handleRegister only consumes the intent if msg.tmux_window_name
+  // matches the windowName spawnFeishu recorded. The old shim reports its
+  // OWN window name (from the prior spawn), so it doesn't match and the
+  // intent survives for the real new shim.
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
+  const spawned: string[][] = []
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
@@ -1446,7 +1468,145 @@ test("feishu-spawn register records tmux_window_name in the thread binding", asy
 
   const daemon = await Daemon.start({
     stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
-    spawnOverride: async () => 0,
+    spawnOverride: async (argv) => { spawned.push(argv); return 0 },
+    defaultCwd: "/tmp/hijack-test", tmuxSession: "claude-feishu",
+  })
+
+  // Deliver a new-topic event → spawnFeishu parks pendingFeishuSpawns[cwd].
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_tesla", chat_id: "oc_chat", chat_type: "p2p",
+      message_type: "text", content: '{"text":"analyze tesla"}', create_time: "0",
+      thread_id: "omt_tesla",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  // Parse the fresh window name out of the spawnOverride argv. The intent
+  // is keyed by cwd but gated by windowName — the stale shim's register
+  // below uses a DIFFERENT window name on purpose.
+  expect(spawned.length).toBe(1)
+  const argv = spawned[0]!
+  const nIdx = argv.indexOf("-n")
+  const freshWindow = argv[nIdx + 1]!
+  expect(freshWindow).toMatch(/^fb:/)
+
+  // Stale shim from a prior spawn is still registered/reconnecting. It
+  // shares the cwd but has its OWN window name. Under the old cwd-only
+  // lookup, this register would drain the intent and bind the Tesla
+  // thread to session=STALE_UUID.
+  const stale = connect(sock)
+  await new Promise<void>((r) => stale.on("connect", () => r()))
+  stale.write(frame({
+    id: 1, op: "register",
+    session_id: "stale-uuid-0000-0000-0000-000000000000",
+    pid: 99999, cwd: "/tmp/hijack-test",
+    tmux_window_name: "fb:oldwindow-xyz",
+  }))
+  await wait(50)
+
+  // Intent must STILL be there — not drained by the stale shim.
+  const pending = (daemon as any).pendingFeishuSpawns as Map<string, any>
+  expect(pending.has("/tmp/hijack-test")).toBe(true)
+
+  // threads.json must NOT have bound Tesla → STALE_UUID.
+  const { loadThreads: lt } = await import("../src/threads")
+  const afterStale = lt(join(dir, "threads.json"))
+  expect(afterStale.threads["omt_tesla"]).toBeUndefined()
+
+  // Now the REAL fresh shim registers with the matching window name.
+  const fresh = connect(sock)
+  await new Promise<void>((r) => fresh.on("connect", () => r()))
+  fresh.write(frame({
+    id: 2, op: "register",
+    session_id: "fresh-uuid-1111-1111-1111-111111111111",
+    pid: 88888, cwd: "/tmp/hijack-test",
+    tmux_window_name: freshWindow,
+  }))
+  await wait(50)
+
+  // NOW the thread should be bound to the fresh session — threading is
+  // preserved.
+  const afterFresh = lt(join(dir, "threads.json"))
+  expect(afterFresh.threads["omt_tesla"]).toBeDefined()
+  expect(afterFresh.threads["omt_tesla"]!.session_id).toBe("fresh-uuid-1111-1111-1111-111111111111")
+  expect(afterFresh.threads["omt_tesla"]!.tmux_window_name).toBe(freshWindow)
+
+  stale.destroy(); fresh.destroy()
+  await daemon.stop()
+})
+
+test("duplicate register with different live pid is rejected, preventing the destroy-reconnect storm", async () => {
+  // Two shims (different processes, different pids, both conns alive) land
+  // on the same session_id because of a UUID-probe race. The previous
+  // DaemonState.register destroyed prev.conn on every duplicate — which for
+  // two live shims meant an infinite destroy-reconnect loop that produced
+  // tens of register events per second and — crucially — kept firing
+  // handleRegister, which in turn hijacked pendingFeishuSpawns for any
+  // fresh spawn in the same cwd. The fix refuses the second live-pid
+  // register so the racing shim exits cleanly.
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: null as any, wsStart: async () => {},
+  })
+
+  const sid = "dup-uuid-0000-0000-0000-000000000000"
+
+  // First shim — becomes the live registrant.
+  const first = connect(sock)
+  await new Promise<void>((r) => first.on("connect", () => r()))
+  const firstReplies: any[] = []
+  const firstParser = new NdjsonParser()
+  first.on("data", (b: Buffer) => firstParser.feed(b.toString("utf8"), (m) => firstReplies.push(m)))
+  first.write(frame({ id: 1, op: "register", session_id: sid, pid: 1001, cwd: "/x" }))
+  await wait(40)
+  expect(firstReplies[0]!.ok).toBe(true)
+
+  // Second shim — different pid, attempts to register under the same sid.
+  const second = connect(sock)
+  await new Promise<void>((r) => second.on("connect", () => r()))
+  const secondReplies: any[] = []
+  const secondParser = new NdjsonParser()
+  second.on("data", (b: Buffer) => secondParser.feed(b.toString("utf8"), (m) => secondReplies.push(m)))
+  second.write(frame({ id: 2, op: "register", session_id: sid, pid: 1002, cwd: "/x" }))
+  await wait(40)
+
+  // Second should be rejected with an explicit error, not accepted.
+  expect(secondReplies[0]!.ok).toBe(false)
+  expect(String(secondReplies[0]!.error)).toContain("already claimed")
+
+  // First must still be live — not torn down by the second register.
+  expect(first.destroyed).toBe(false)
+
+  // daemon.state should still hold the first shim's entry.
+  const entry = (daemon as any).state.get(sid)
+  expect(entry).toBeDefined()
+  expect(entry.pid).toBe(1001)
+
+  first.destroy(); second.destroy()
+  await daemon.stop()
+})
+
+test("feishu-spawn register records tmux_window_name in the thread binding", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const spawned: string[][] = []
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async (argv) => { spawned.push(argv); return 0 },
     defaultCwd: "/tmp/dwn-test", tmuxSession: "claude-feishu",
   })
 
@@ -1462,18 +1622,25 @@ test("feishu-spawn register records tmux_window_name in the thread binding", asy
   } as any, "ou_bot")
   await wait(30)
 
-  // Register a "shim" with a tmux_window_name.
+  // handleRegister gates pendingFeishuSpawns consumption on tmux_window_name
+  // matching the windowName spawnFeishu chose for the tmux new-window call.
+  // Parse it out of the captured argv so the register below actually matches.
+  expect(spawned.length).toBe(1)
+  const argv = spawned[0]!
+  const spawnWindow = argv[argv.indexOf("-n") + 1]!
+
+  // Register a "shim" with the matching tmux_window_name.
   const s = connect(sock)
   await new Promise((r) => s.once("connect", () => r(null)))
   s.write(frame({
     op: "register", session_id: "fake-uuid-1234-5678-9abc-def012345678",
-    pid: 1, cwd: "/tmp/dwn-test", tmux_window_name: "fb:hello-xyz123",
+    pid: 1, cwd: "/tmp/dwn-test", tmux_window_name: spawnWindow,
   } as any))
   await wait(50)
 
   const { loadThreads: lt } = await import("../src/threads")
   const store = lt(join(dir, "threads.json"))
-  expect(store.threads["omt_preexisting"]!.tmux_window_name).toBe("fb:hello-xyz123")
+  expect(store.threads["omt_preexisting"]!.tmux_window_name).toBe(spawnWindow)
 
   s.destroy()
   await daemon.stop()
@@ -1529,6 +1696,12 @@ test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone
     defaultCwd: "/tmp", tmuxSession: "claude-feishu",
   })
 
+  // Daemon.start flips active→inactive at boot. Re-flip the row we want
+  // swept; without this the new selector's skip-inactive filter would
+  // (correctly) ignore it. In production a reconnecting shim would do this
+  // re-flip via handleRegister within the warmup window.
+  ;(daemon as any).threads.threads["t_feishu_stale"].status = "active"
+
   const result = await daemon.runIdleSweepOnce(now)
   expect(result.killed).toEqual(["t_feishu_stale"])
 
@@ -1543,5 +1716,59 @@ test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone
   expect(back.threads["t_feishu_stale"]!.status).toBe("inactive")
   expect(back.threads["t_terminal_stale"]!.status).toBe("inactive")
 
+  await daemon.stop()
+})
+
+// Without this bump, a thread that was already swept (status=inactive,
+// last_message_at very old) gets revived by resumeSession when the user
+// returns — but resumeSession only updates last_active_at. Until Claude
+// finally produces an outbound reply (which can take seconds to minutes),
+// last_message_at stays old. Combined with the selector's 24h staleness
+// check, the very next sweep tick (~12h later) would re-fire the hibernate
+// notice on a thread the user is actively chatting in.
+test("inbound feishu message into a known thread bumps last_message_at", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
+  const sock = join(dir, "daemon.sock")
+  const api = new FeishuApi({
+    im: {
+      message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
+      messageReaction: { create: async () => ({}) },
+      messageResource: { get: async () => ({ writeFile: async () => {} }) },
+      image: { create: async () => ({}) }, file: { create: async () => ({}) },
+    },
+  })
+  const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
+  saveAccess(join(dir, "access.json"), acc)
+
+  const threadsFile = join(dir, "threads.json")
+  const { loadThreads, saveThreads: st } = await import("../src/threads")
+  const store = loadThreads(threadsFile)
+  store.threads["t_revived"] = {
+    session_id: "S_REVIVED", claude_session_uuid: "uuid-revived",
+    chat_id: "oc_dm", root_message_id: "m_root", cwd: "/tmp",
+    origin: "feishu", status: "inactive",
+    last_active_at: 1, last_message_at: 1,  // ancient
+  }
+  st(threadsFile, store)
+
+  const daemon = await Daemon.start({
+    stateDir: dir, socketPath: sock, feishuApi: api, wsStart: async () => {},
+    spawnOverride: async () => 0,
+    defaultCwd: "/tmp", tmuxSession: "claude-feishu",
+  })
+
+  const before = Date.now()
+  await daemon.deliverFeishuEvent({
+    sender: { sender_id: { open_id: "ou_abc" }, sender_type: "user" },
+    message: {
+      message_id: "om_revive", chat_id: "oc_dm", chat_type: "p2p",
+      thread_id: "t_revived",
+      message_type: "text", content: '{"text":"are you there"}', create_time: "0",
+    },
+  } as any, "ou_bot")
+  await wait(30)
+
+  const back = loadThreads(threadsFile)
+  expect(back.threads["t_revived"]!.last_message_at).toBeGreaterThanOrEqual(before)
   await daemon.stop()
 })

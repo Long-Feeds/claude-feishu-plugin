@@ -15,6 +15,12 @@ export function selectIdleFeishuThreads(
   for (const [tid, rec] of Object.entries(store.threads)) {
     if (rec.origin !== "feishu") continue
     if (rec.status === "closed") continue
+    // Already swept once: runIdleSweep flips status→inactive but doesn't
+    // advance last_message_at, so without this filter the next tick would
+    // re-select the same record and re-post the hibernate notice every
+    // FEISHU_IDLE_SWEEP_HOURS forever. resumeSession flips it back to
+    // active when the user returns, which re-arms eligibility legitimately.
+    if (rec.status === "inactive") continue
     if (now - rec.last_message_at <= idleMs) continue
     out.push({ ...rec, thread_id: tid })
   }

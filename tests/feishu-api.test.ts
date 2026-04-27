@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { FeishuApi, type LarkLike } from "../src/feishu-api"
+import { FeishuApi, preprocessMarkdownForFeishu, type LarkLike } from "../src/feishu-api"
 
 function mockClient(): { client: LarkLike; calls: any[] } {
   const calls: any[] = []
@@ -65,4 +65,64 @@ test("reactTo calls messageReaction.create", async () => {
   await api.reactTo("m1", "THUMBSUP")
   expect(calls[0]!.op).toBe("react")
   expect(calls[0]!.args.data.reaction_type.emoji_type).toBe("THUMBSUP")
+})
+
+test("preprocessMarkdownForFeishu leaves text without tables unchanged", () => {
+  const input = "# Heading\n\n**bold** and a [link](https://x.com)\n\n- one\n- two"
+  expect(preprocessMarkdownForFeishu(input)).toBe(input)
+})
+
+test("preprocessMarkdownForFeishu rewrites a GFM table into an aligned code block", () => {
+  const input = [
+    "before",
+    "",
+    "| Name | Age |",
+    "| --- | ---: |",
+    "| Alice | 30 |",
+    "| Bob | 2 |",
+    "",
+    "after",
+  ].join("\n")
+  const out = preprocessMarkdownForFeishu(input)
+  // Table turned into a fenced block with aligned columns; right-aligned Age.
+  expect(out).toContain("```")
+  expect(out).toContain("| Name  | Age |")
+  expect(out).toContain("| Alice |  30 |")
+  expect(out).toContain("| Bob   |   2 |")
+  // Surrounding text preserved.
+  expect(out.startsWith("before\n\n```")).toBe(true)
+  expect(out.endsWith("```\n\nafter")).toBe(true)
+})
+
+test("preprocessMarkdownForFeishu respects center alignment marker", () => {
+  const input = "| A | B |\n| :-: | :-: |\n| xx | yyyy |"
+  const out = preprocessMarkdownForFeishu(input)
+  // Column A width 2, B width 4; centered.
+  expect(out).toContain("| A  |  B   |")
+  expect(out).toContain("| xx | yyyy |")
+})
+
+test("preprocessMarkdownForFeishu leaves tables inside code fences alone", () => {
+  const input = [
+    "```markdown",
+    "| A | B |",
+    "| --- | --- |",
+    "| 1 | 2 |",
+    "```",
+  ].join("\n")
+  expect(preprocessMarkdownForFeishu(input)).toBe(input)
+})
+
+test("preprocessMarkdownForFeishu ignores pipe lines that aren't tables", () => {
+  const input = 'echo "a|b|c"\nanother line'
+  expect(preprocessMarkdownForFeishu(input)).toBe(input)
+})
+
+test("preprocessMarkdownForFeishu handles CJK widths when aligning", () => {
+  const input = "| 姓名 | 年龄 |\n| --- | --- |\n| 张三 | 30 |\n| 李四四 | 2 |"
+  const out = preprocessMarkdownForFeishu(input)
+  // Widest name column is 李四四 (6 cells); header 姓名 is 4 cells — padded.
+  expect(out).toContain("| 姓名   | 年龄 |")
+  expect(out).toContain("| 张三   | 30   |")
+  expect(out).toContain("| 李四四 | 2    |")
 })

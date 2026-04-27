@@ -42,6 +42,23 @@ test("selectIdleFeishuThreads SKIPS status=closed even if very stale", () => {
   expect(selectIdleFeishuThreads(s, now, day, 20)).toEqual([])
 })
 
+// Without this filter, a thread that was already swept once (status flipped
+// to inactive by runIdleSweep, last_message_at left untouched) would re-qualify
+// on every subsequent sweep tick and fire the hibernate notice repeatedly —
+// the user-visible bug was multiple identical "🛌 已休眠" messages spaced
+// FEISHU_IDLE_SWEEP_HOURS apart in the same thread.
+test("selectIdleFeishuThreads SKIPS status=inactive (already swept once)", () => {
+  const now = 1_800_000_000_000
+  const s = store({
+    t_already_swept: {
+      session_id: "S6", chat_id: "c", root_message_id: "m", cwd: "/w",
+      origin: "feishu", status: "inactive",
+      last_active_at: now - 5 * day, last_message_at: now - 5 * day,
+    },
+  })
+  expect(selectIdleFeishuThreads(s, now, day, 20)).toEqual([])
+})
+
 test("selectIdleFeishuThreads boundary: exactly idleMs old is NOT selected", () => {
   const now = 1_800_000_000_000
   const s = store({

@@ -290,10 +290,25 @@ export class Daemon {
     }
     const session_id: string = msg.session_id
 
-    this.state.register({
+    const regResult = this.state.register({
       session_id, conn, cwd: msg.cwd, pid: msg.pid, registered_at: Date.now(),
       ...(msg.tmux_window_name ? { tmux_window_name: msg.tmux_window_name } : {}),
     })
+    if (!regResult.ok && regResult.reason === "duplicate-live-pid") {
+      process.stderr.write(
+        `daemon: handleRegister REJECTED session_id=${session_id} pid=${msg.pid} ` +
+        `— another live shim (pid=${regResult.prev.pid}) is already registered under this id; ` +
+        `likely a UUID-probe race. Instructing shim to exit.\n`
+      )
+      try {
+        conn.write(frame({
+          id: msg.id, ok: false,
+          error: `session_id already claimed by live shim pid=${regResult.prev.pid} — exiting to break UUID-collision loop`,
+        }))
+      } catch {}
+      try { conn.destroy() } catch {}
+      return
+    }
     // If the session already has a thread binding, flip status back to active
     // (e.g. shim reconnecting after daemon restart, or resume-dedup match).
     if (findBySessionId(this.threads, session_id)) {
@@ -323,8 +338,27 @@ export class Daemon {
     // from the jsonl that claude wrote when we send-keys'd the trigger
     // prompt into the pane). Pair it with the cwd-keyed spawn intent
     // parked by spawnFeishu.
+    //
+    // The intent is keyed by cwd, but we REQUIRE the registering shim's
+    // tmux_window_name to match the window that spawnFeishu created. Without
+    // that check, any other shim registering in the same cwd (e.g. a stale
+    // shim from a prior window stuck in a reconnect loop due to a shared
+    // session_id) could steal the intent, binding the new feishu thread to
+    // an unrelated old session. When that happens the real shim's later
+    // reply falls through to the terminal path and posts as a new root
+    // message — i.e. what looks to the operator like "this reply became a
+    // new topic instead of threading under the user's question."
     const spawnIntent = this.pendingFeishuSpawns.get(msg.cwd)
-    if (spawnIntent) {
+    const spawnIntentMatches =
+      !!spawnIntent && spawnIntent.windowName === msg.tmux_window_name
+    if (spawnIntent && !spawnIntentMatches) {
+      process.stderr.write(
+        `daemon: handleRegister ignoring pendingFeishuSpawns[${msg.cwd}] — ` +
+        `window_name mismatch (intent=${spawnIntent.windowName} vs msg=${msg.tmux_window_name ?? "<none>"}); ` +
+        `likely a stale shim in the same cwd\n`
+      )
+    }
+    if (spawnIntent && spawnIntentMatches) {
       this.pendingFeishuSpawns.delete(msg.cwd)
       // Bind the feishu state to the real UUID now that we know it.
       if (spawnIntent.preExistingThreadId) {
@@ -344,7 +378,8 @@ export class Daemon {
       }
       process.stderr.write(`daemon: feishu-spawn bound cwd=${msg.cwd} session=${session_id}\n`)
     }
-    const isFeishuSpawn = this.pendingFeishuInbound.has(session_id) || !!spawnIntent
+    const isFeishuSpawn =
+      this.pendingFeishuInbound.has(session_id) || spawnIntentMatches
     const alreadyBound = !!findBySessionId(this.threads, session_id)
     const alreadyPending = this.pendingRoots.has(session_id)
     const ignoredCwd = this.isIgnoredCwd(msg.cwd)
@@ -973,6 +1008,16 @@ export class Daemon {
         }
         return
       }
+      // Inbound user activity advances the idle clock. Without this, an
+      // already-hibernated thread the user is now reviving stays "stale" by
+      // last_message_at until Claude produces its first outbound reply
+      // (handleReply / hook_post mirror) — a window that can be many seconds
+      // and is not guaranteed (resume could fail). The next sweep tick would
+      // then re-fire the hibernate notice on a thread the user is actively
+      // chatting in. Persisting because saveThreads is the only durable
+      // signal between daemon ticks.
+      this.threads.threads[thread_id]!.last_message_at = Date.now()
+      saveThreads(this.threadsFile, this.threads)
       const entry = this.state.get(rec.session_id)
       process.stderr.write(`daemon: thread ${thread_id} → session ${rec.session_id} → entry ${entry ? "FOUND" : "MISSING"}\n`)
       if (entry) {
