@@ -171,3 +171,35 @@ test("truncates a single file that exceeds the 32 KB per-file cap", () => {
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+test("drops trailing sections when aggregate exceeds 64 KB cap", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    const body = "X".repeat(30 * 1024)
+    writeFileSync(join(ws, "SOUL.md"), body)
+    writeFileSync(join(ws, "USER.md"), body)
+    writeFileSync(join(ws, "FEISHU.md"), body)
+    writeFileSync(join(ws, "AGENTS.md"), body)
+
+    const orig = process.stderr.write.bind(process.stderr)
+    const logs: string[] = []
+    ;(process.stderr as any).write = (chunk: any) => {
+      logs.push(typeof chunk === "string" ? chunk : chunk.toString())
+      return true
+    }
+    let out = ""
+    try {
+      out = loadBootstrap(stateDir)
+    } finally {
+      ;(process.stderr as any).write = orig
+    }
+
+    expect(out).toContain("## SOUL")
+    expect(out).not.toContain("## AGENTS")
+    expect(logs.join("")).toMatch(/bootstrap: aggregate exceeds 64KB/)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
