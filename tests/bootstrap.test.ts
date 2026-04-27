@@ -172,6 +172,66 @@ test("truncates a single file that exceeds the 32 KB per-file cap", () => {
   }
 })
 
+test("does not split a 3-byte UTF-8 codepoint at the 32 KB cap (no U+FFFD)", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    // 32767 ASCII bytes + '中' (3-byte UTF-8: E4 B8 AD). The per-file cap of
+    // 32768 lands on the second byte of the CJK sequence — naive byte
+    // truncation produces a partial codepoint that toString("utf8")
+    // replaces with U+FFFD.
+    const body = "A".repeat(32 * 1024 - 1) + "中".repeat(64)
+    writeFileSync(join(ws, "SOUL.md"), body)
+
+    const orig = process.stderr.write.bind(process.stderr)
+    ;(process.stderr as any).write = () => true
+    let out = ""
+    try {
+      out = loadBootstrap(stateDir)
+    } finally {
+      ;(process.stderr as any).write = orig
+    }
+
+    expect(out).not.toContain("�")
+    const soulIdx = out.indexOf("## SOUL\n") + "## SOUL\n".length
+    const tail = out.indexOf("\n\n---\n\n# User Message", soulIdx)
+    const sectionBody = out.slice(soulIdx, tail)
+    expect(Buffer.byteLength(sectionBody, "utf8")).toBeLessThanOrEqual(32 * 1024)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test("does not split a 4-byte UTF-8 codepoint at the 32 KB cap (no U+FFFD)", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    // 32766 ASCII bytes + '🦞' (4-byte UTF-8: F0 9F A6 9E). The cap lands
+    // two bytes into the emoji sequence.
+    const body = "A".repeat(32 * 1024 - 2) + "🦞".repeat(64)
+    writeFileSync(join(ws, "SOUL.md"), body)
+
+    const orig = process.stderr.write.bind(process.stderr)
+    ;(process.stderr as any).write = () => true
+    let out = ""
+    try {
+      out = loadBootstrap(stateDir)
+    } finally {
+      ;(process.stderr as any).write = orig
+    }
+
+    expect(out).not.toContain("�")
+    const soulIdx = out.indexOf("## SOUL\n") + "## SOUL\n".length
+    const tail = out.indexOf("\n\n---\n\n# User Message", soulIdx)
+    const sectionBody = out.slice(soulIdx, tail)
+    expect(Buffer.byteLength(sectionBody, "utf8")).toBeLessThanOrEqual(32 * 1024)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
 test("drops trailing sections when aggregate exceeds 64 KB cap", () => {
   const stateDir = tempStateDir()
   try {

@@ -5,6 +5,16 @@ const FILES = ["SOUL.md", "USER.md", "FEISHU.md", "AGENTS.md"] as const
 const PER_FILE_CAP = 32 * 1024
 const AGG_CAP = 64 * 1024
 
+function truncateUtf8(buf: Buffer, maxBytes: number): Buffer {
+  if (buf.length <= maxBytes) return buf
+  // If the byte AT `end` is a UTF-8 continuation byte (10xxxxxx), the cap
+  // landed inside a multi-byte codepoint. Walk back to the codepoint's
+  // lead byte and drop it too, so toString("utf8") never emits U+FFFD.
+  let end = maxBytes
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--
+  return buf.subarray(0, end)
+}
+
 export function loadBootstrap(stateDir: string): string {
   const dir = join(stateDir, "workspace")
   const sections: string[] = []
@@ -19,10 +29,10 @@ export function loadBootstrap(stateDir: string): string {
       }
       continue
     }
-    if (Buffer.byteLength(body, "utf8") > PER_FILE_CAP) {
+    const buf = Buffer.from(body, "utf8")
+    if (buf.length > PER_FILE_CAP) {
       process.stderr.write(`bootstrap: ${name} exceeds 32KB cap, truncating\n`)
-      const buf = Buffer.from(body, "utf8").subarray(0, PER_FILE_CAP)
-      body = buf.toString("utf8")
+      body = truncateUtf8(buf, PER_FILE_CAP).toString("utf8")
     }
     const trimmed = body.trim()
     if (!trimmed) continue
