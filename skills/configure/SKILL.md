@@ -7,8 +7,11 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(uname *)
+  - Bash(id *)
   - Bash(systemctl --user *)
   - Bash(journalctl --user *)
+  - Bash(launchctl *)
 ---
 
 # /feishu:configure — Feishu Channel Setup
@@ -88,23 +91,55 @@ offer.
 Delete the `FEISHU_APP_ID=` and `FEISHU_APP_SECRET=` lines (or the file if
 those are the only lines).
 
-### `install-service` — write and enable the systemd user service
+### `install-service` — write and enable the daemon service
 
-1. Resolve `${PLUGIN_ROOT}` to the plugin's absolute path (typically `$CLAUDE_PLUGIN_ROOT` or the caller's cwd if set). Resolve `${HOME}` to the user's home directory.
-2. Read the template at `${PLUGIN_ROOT}/systemd/claude-feishu.service.tmpl`.
-3. Replace literal `${PLUGIN_ROOT}` and `${HOME}` tokens in the template.
-4. `mkdir -p ~/.config/systemd/user`.
-5. Write the rendered unit to `~/.config/systemd/user/claude-feishu.service`.
-6. Run `systemctl --user daemon-reload`.
-7. Run `systemctl --user enable --now claude-feishu`.
-8. Wait ~1s, then `systemctl --user status claude-feishu --no-pager` and show the result.
-9. Tell the user: live logs are at `journalctl --user -u claude-feishu -f`.
+Detect the platform with `uname -s` and dispatch:
 
-### `uninstall-service` — disable and remove the systemd user service
+- `Linux` → systemd user service path below
+- `Darwin` → launchd user-agent path below
+- anything else → tell the user the platform isn't supported and bail
+
+Before either path, resolve `${PLUGIN_ROOT}` to the plugin's absolute path (typically `$CLAUDE_PLUGIN_ROOT` or the caller's cwd if set) and `${HOME}` to the user's home directory. Both templates use these two tokens only.
+
+#### Linux — systemd
+
+1. Read the template at `${PLUGIN_ROOT}/systemd/claude-feishu.service.tmpl`.
+2. Replace literal `${PLUGIN_ROOT}` and `${HOME}` tokens in the template.
+3. `mkdir -p ~/.config/systemd/user`.
+4. Write the rendered unit to `~/.config/systemd/user/claude-feishu.service`.
+5. Run `systemctl --user daemon-reload`.
+6. Run `systemctl --user enable --now claude-feishu`.
+7. Wait ~1s, then `systemctl --user status claude-feishu --no-pager` and show the result.
+8. Tell the user: live logs are at `journalctl --user -u claude-feishu -f`.
+
+#### macOS — launchd
+
+1. Read the template at `${PLUGIN_ROOT}/launchd/com.claude-feishu.plist.tmpl`.
+2. Replace literal `${PLUGIN_ROOT}` and `${HOME}` tokens in the template.
+3. `mkdir -p ~/Library/LaunchAgents` and `mkdir -p ~/.claude/channels/feishu` (the plist's `StandardOutPath` writes there at load time).
+4. Write the rendered plist to `~/Library/LaunchAgents/com.claude-feishu.plist`.
+5. Resolve `UID=$(id -u)`. If `launchctl print gui/$UID/com.claude-feishu` succeeds, the job is already loaded — run `launchctl bootout gui/$UID/com.claude-feishu` first so the new plist replaces the old one. Ignore errors (absent job is fine).
+6. Run `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.claude-feishu.plist`.
+7. Run `launchctl kickstart -k gui/$UID/com.claude-feishu` to ensure it's running (idempotent — no-op if already started by `RunAtLoad`).
+8. Wait ~1s, then `launchctl print gui/$UID/com.claude-feishu 2>&1 | head -40` and show the result (state, last exit status, PID).
+9. Tell the user: live logs are at `~/.claude/channels/feishu/daemon.log` (`tail -f` it).
+
+### `uninstall-service` — disable and remove the daemon service
+
+Detect the platform with `uname -s` and dispatch:
+
+#### Linux — systemd
 
 1. Run `systemctl --user disable --now claude-feishu`.
 2. Remove `~/.config/systemd/user/claude-feishu.service`.
 3. Run `systemctl --user daemon-reload`.
+4. Confirm.
+
+#### macOS — launchd
+
+1. Resolve `UID=$(id -u)`.
+2. Run `launchctl bootout gui/$UID/com.claude-feishu` (ignore error if not loaded).
+3. Remove `~/Library/LaunchAgents/com.claude-feishu.plist`.
 4. Confirm.
 
 ### `set-hub <chat_id>` — set the hub chat for terminal sessions

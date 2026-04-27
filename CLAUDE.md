@@ -6,9 +6,9 @@
 
 ## 架构
 
-- **daemon** (`src/daemon.ts`) 作为 systemd user service 跑，独占 WSClient，负责
-  所有 Feishu API + 路由 + spawn 新 session（`tmux new-window` in session
-  `claude-feishu`）。
+- **daemon** (`src/daemon.ts`) 作为用户级服务跑（Linux: systemd `--user`；
+  macOS: launchd user-agent），独占 WSClient，负责所有 Feishu API + 路由 + spawn
+  新 session（`tmux new-window` in session `claude-feishu`）。
 - **shim** (`src/shim.ts`) 由 Claude Code 通过 `.mcp.json` 拉起，每个 Claude
   session 一个，是 MCP stdio ↔ daemon Unix socket 的翻译层。
 - **access / threads 状态** 在 `~/.claude/channels/feishu/` 下：`.env` +
@@ -46,7 +46,9 @@ tests/                        # bun:test
     fake-daemon.ts
     shim.test.ts
 systemd/
-  claude-feishu.service.tmpl  # 由 /feishu:configure install-service 渲染
+  claude-feishu.service.tmpl  # Linux: 由 /feishu:configure install-service 渲染
+launchd/
+  com.claude-feishu.plist.tmpl # macOS: 同上
 skills/
   configure/SKILL.md
   access/SKILL.md
@@ -97,9 +99,10 @@ skills/
   重定向到 stderr。新增日志一律走 `process.stderr.write` 或 `console.error`。
 - **double-reply on pair**：pairing 模式下 `replies` 计数限制为 2，避免被恶
   意刷码。改 gate 时小心别破坏这个上限。
-- **systemd 的 PATH 很窄**：daemon unit 里显式写 `Environment=PATH=$HOME/.bun/bin:...`
-  才能找到 bun。升级 bun 或移动安装路径时，记得同步改 unit 文件或重装服务
-  （`/feishu:configure install-service`）。
+- **service 的 PATH 很窄**：systemd unit 和 launchd plist 里都显式写
+  `PATH=$HOME/.bun/bin:...` 才能找到 bun / tmux / claude。升级 bun、换
+  Homebrew 前缀（Apple Silicon 走 `/opt/homebrew`，Intel 走 `/usr/local`）、
+  或移动安装路径时，记得同步改模板或重装服务（`/feishu:configure install-service`）。
 - **shim 重连必须用同一个 session_id 重注册**：daemon 重启后每个 shim 会自动
   指数退避重连，关键是用**原来的** session_id 再次 register，daemon 才能从
   threads.json 恢复 thread 绑定。改 shim 的 keepAlive 循环时小心别丢掉这点。
