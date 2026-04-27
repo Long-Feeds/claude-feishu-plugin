@@ -2,6 +2,7 @@ import { readFileSync } from "fs"
 import { join } from "path"
 
 const FILES = ["SOUL.md", "USER.md", "FEISHU.md", "AGENTS.md"] as const
+const PER_FILE_CAP = 32 * 1024
 
 export function loadBootstrap(stateDir: string): string {
   const dir = join(stateDir, "workspace")
@@ -16,6 +17,11 @@ export function loadBootstrap(stateDir: string): string {
         process.stderr.write(`bootstrap: failed to read ${name}: ${(e as Error).message}\n`)
       }
       continue
+    }
+    if (Buffer.byteLength(body, "utf8") > PER_FILE_CAP) {
+      process.stderr.write(`bootstrap: ${name} exceeds 32KB cap, truncating\n`)
+      const buf = Buffer.from(body, "utf8").subarray(0, PER_FILE_CAP)
+      body = buf.toString("utf8")
     }
     const trimmed = body.trim()
     if (!trimmed) continue

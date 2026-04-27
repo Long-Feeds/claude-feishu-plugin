@@ -137,3 +137,37 @@ test("logs and skips a file that cannot be read (EACCES), keeps loading the rest
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+test("truncates a single file that exceeds the 32 KB per-file cap", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    const big = "A".repeat(40 * 1024) // 40 KB
+    writeFileSync(join(ws, "SOUL.md"), big)
+
+    const orig = process.stderr.write.bind(process.stderr)
+    const logs: string[] = []
+    ;(process.stderr as any).write = (chunk: any) => {
+      logs.push(typeof chunk === "string" ? chunk : chunk.toString())
+      return true
+    }
+    let out = ""
+    try {
+      out = loadBootstrap(stateDir)
+    } finally {
+      ;(process.stderr as any).write = orig
+    }
+
+    expect(out).toContain("## SOUL\n")
+    const soulIdx = out.indexOf("## SOUL\n") + "## SOUL\n".length
+    const nextSection = out.indexOf("\n\n##", soulIdx)
+    const tail = out.indexOf("\n\n---\n\n# User Message", soulIdx)
+    const end = nextSection === -1 ? tail : Math.min(nextSection, tail)
+    const body = out.slice(soulIdx, end)
+    expect(body.length).toBeLessThanOrEqual(32 * 1024)
+    expect(logs.join("")).toMatch(/bootstrap: SOUL\.md exceeds 32KB cap/)
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
