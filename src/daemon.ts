@@ -11,6 +11,7 @@ import { gate, type FeishuEvent } from "./gate"
 import { loadAccess, saveAccess } from "./access"
 import { loadThreads, saveThreads, upsertThread, findByThreadId, findBySessionId, markActive, markInactive, pruneInactive, prunePendingRoots, type ThreadStore, type ThreadRecord } from "./threads"
 import { buildSpawnCommand, ensureTmuxSession, tmuxNameSlug } from "./spawn"
+import { loadBootstrap } from "./bootstrap"
 import { runIdleSweep, sweepIntervalMs } from "./idle-sweep"
 import { extractTextAndAttachment } from "./inbound"
 
@@ -1169,14 +1170,20 @@ export class Daemon {
     const { realpathSync } = await import("fs")
     let cwd = rawCwd
     try { cwd = realpathSync(rawCwd) } catch { /* keep rawCwd as-is */ }
-    const { text: prompt, attachment } = extractTextAndAttachment(event)
+    const { text: rawPrompt, attachment } = extractTextAndAttachment(event)
     // Window name carries the prompt's first 5 chars for at-a-glance
     // identification in `tmux list-windows` (otherwise every fb: window looks
     // like an opaque random string). The trailing random suffix preserves
-    // uniqueness across concurrent spawns of the same prompt.
-    const slug = tmuxNameSlug(prompt, 5)
+    // uniqueness across concurrent spawns of the same prompt. Use the raw
+    // user prompt so window names stay scannable (not the bootstrap header).
+    const slug = tmuxNameSlug(rawPrompt, 5)
     const rand = Math.random().toString(36).slice(2, 8)
     const windowName = slug ? `fb:${slug}-${rand}` : `fb:${rand}`
+    // Prepend channel-level bootstrap context (SOUL.md / USER.md / FEISHU.md /
+    // AGENTS.md from <stateDir>/workspace/) once per fresh feishu spawn. Empty
+    // when no bootstrap files exist — falls through to today's behaviour.
+    const bootstrap = loadBootstrap(this.cfg.stateDir)
+    const prompt = bootstrap + rawPrompt
 
     // Flow reality: Claude Code does NOT write the session jsonl until the
     // FIRST user prompt lands in the session (MCP init alone doesn't
