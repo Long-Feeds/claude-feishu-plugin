@@ -1233,7 +1233,17 @@ export class Daemon {
     // Give up on this spawn if shim never registers (claude crashed,
     // jsonl-write wedged, etc.). Acts as the "UUID not resolvable" error
     // path the user asked for — we react ❌ and reply in-thread.
-    const giveUpMs = Number(process.env.FEISHU_SPAWN_REGISTER_TIMEOUT_MS ?? "30000")
+    //
+    // Budget reasoning: the shim's UUID probe (FEISHU_SHIM_UUID_PROBE_MS,
+    // default 30s) starts AFTER claude has loaded .mcp.json and spawned
+    // `bun run shim` — typically 3-5s into spawnFeishu, longer on cold
+    // bun cache or slow filesystems. If we time out at 30s here, the shim
+    // is still probing and we post a spurious "shim never registered"
+    // error to the user. Sizing this to (shim probe + claude startup
+    // buffer) keeps the daemon timeout strictly downstream of the shim's
+    // own deadline, so users only see this error when the shim genuinely
+    // failed — not when the race timer fired first.
+    const giveUpMs = Number(process.env.FEISHU_SPAWN_REGISTER_TIMEOUT_MS ?? "60000")
     setTimeout(() => {
       const entry = this.pendingFeishuSpawns.get(cwd)
       if (!entry || entry.startedAt >= Date.now() - giveUpMs + 100) return // superseded
@@ -1244,7 +1254,13 @@ export class Daemon {
         this.cfg.feishuApi.reactTo(trigger, "CrossMark").catch(() => {})
         this.cfg.feishuApi.sendInThread({
           root_message_id: trigger,
-          text: `❌ Failed to start claude session in \`${cwd}\` — shim never registered within ${giveUpMs}ms. Check daemon logs.`,
+          text:
+            `❌ Failed to start claude session in \`${cwd}\` — shim never registered within ${giveUpMs}ms.\n\n` +
+            `Common causes:\n` +
+            `- \`claude\` failed to launch in the tmux pane (peek with \`tmux attach -t claude-feishu\`)\n` +
+            `- \`bun\` not on the systemd PATH (re-run \`/feishu:configure install-service\` after upgrading bun)\n` +
+            `- claude could not write its session jsonl in time (check \`~/.claude/channels/feishu/shim-debug.log\`)\n\n` +
+            `Daemon logs: \`journalctl --user -u claude-feishu -e\`.`,
           format: "markdown", seed_thread: !preExistingThreadId,
         }).catch(() => {})
       }

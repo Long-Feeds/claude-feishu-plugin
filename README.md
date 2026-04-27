@@ -96,11 +96,13 @@ claude plugin marketplace add Long-Feeds/claude-feishu-plugin
 claude plugin install feishu@claude-feishu
 ```
 
-The first run will auto-install dependencies (`@larksuiteoapi/node-sdk`,
-MCP SDK) via the `bun install` step in `.mcp.json` — give it a few seconds.
+The first run installs dependencies (`@larksuiteoapi/node-sdk`, MCP SDK).
+Run `bun install` once in the plugin's checkout (the marketplace install
+already does this), or `/feishu:configure install-service` will do it as
+part of the daemon setup.
 
 > **Requires** [Bun](https://bun.sh/) on `PATH` — `.mcp.json` launches the
-> server with `bun run start`.
+> per-session MCP shim with `bun run shim`.
 
 To uninstall later: `claude plugin uninstall feishu` and
 `claude plugin marketplace remove claude-feishu`.
@@ -286,6 +288,9 @@ Manage access with `/feishu:access`:
 | `FEISHU_APP_SECRET` | Feishu app secret |
 | `FEISHU_STATE_DIR` | Override state directory (default: `~/.claude/channels/feishu`) |
 | `FEISHU_ACCESS_MODE` | Set to `static` for read-only access config |
+| `FEISHU_SPAWN_REGISTER_TIMEOUT_MS` | Daemon watchdog for feishu-spawn shim registration (default `60000`). Must be larger than `FEISHU_SHIM_UUID_PROBE_MS` plus a buffer for `claude` startup, otherwise the daemon will post a spurious "shim never registered" error before the shim has had a chance to finish probing. |
+| `FEISHU_SHIM_UUID_PROBE_MS` | Shim deadline for resolving Claude's session jsonl UUID (default `30000`). Sized to absorb cold-cache filesystem latency. |
+| `FEISHU_DEFAULT_CWD` | Initial cwd for feishu-spawned sessions (default: `$HOME/workspace`). |
 
 ### Bootstrap files
 
@@ -311,7 +316,9 @@ than `ENOENT` are logged to the daemon journal and do not block the spawn.
 
 ## Requirements
 
-- [Bun](https://bun.sh/) runtime — used by `.mcp.json` to launch `server.ts`
+- [Bun](https://bun.sh/) runtime — used by `.mcp.json` to launch the MCP shim
+  and by the systemd unit to run the daemon
+- `tmux` on `PATH`
 - Claude Code 2.1+ (with `claude plugin marketplace` support)
 - A Feishu (Lark) self-built app with Bot capability
 
@@ -321,11 +328,18 @@ than `ENOENT` are logged to the daemon journal and do not block the spawn.
 .claude-plugin/
   plugin.json          # plugin metadata
   marketplace.json     # local marketplace manifest (registers ./ as the plugin)
-.mcp.json              # tells Claude Code how to launch the MCP server
-server.ts              # single-file MCP server (~1k LOC)
+.mcp.json              # tells Claude Code to launch src/shim.ts via `bun run shim`
+src/
+  daemon.ts            # systemd-managed long-running process; sole WSClient holder
+  shim.ts              # per-session MCP server; stdio ↔ daemon Unix socket
+  ...                  # gate, threads, access, spawn, ipc, inbound, idle-sweep
+hooks/
+  user-prompt.ts       # UserPromptSubmit → daemon (seeds thread title)
+  mirror-stop.ts       # Stop hook → daemon (mirrors final assistant text)
 skills/
   configure/SKILL.md   # /feishu:configure
   access/SKILL.md      # /feishu:access
+server.ts              # legacy single-file implementation, kept as rollback only
 test-ws.ts             # standalone WebSocket smoke test (debugging only)
 ACCESS.md              # full access control reference
 ```
@@ -341,7 +355,19 @@ ACCESS.md              # full access control reference
   stale `bun server.ts` running elsewhere. With the same `APP_ID`, Feishu only
   delivers each event to one connected client.
 - **`bun: command not found`** — install Bun and ensure it's on `PATH` for the
-  shell that launches Claude Code. `.mcp.json` shells out via `bun run start`.
+  shell that launches Claude Code. `.mcp.json` shells out via `bun run shim`,
+  and the systemd unit also needs `bun` reachable from its `PATH=` line. After
+  upgrading or moving Bun, re-run `/feishu:configure install-service` so the
+  unit file picks up the new path.
+- **`shim never registered within Nms`** posted in a thread — the daemon's
+  watchdog gave up waiting for the per-session shim to register. `claude` may
+  have failed to launch in the tmux pane (peek with `tmux attach -t
+  claude-feishu`), or it could not write its session jsonl in time. Check
+  `~/.claude/channels/feishu/shim-debug.log` for the shim's UUID-probe
+  trail, and `journalctl --user -u claude-feishu -e` for the daemon side.
+  The watchdog is sized to comfortably exceed normal startup; bump
+  `FEISHU_SPAWN_REGISTER_TIMEOUT_MS` in `~/.claude/channels/feishu/.env`
+  if you genuinely need a longer budget.
 
 ## License
 
