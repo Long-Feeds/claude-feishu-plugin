@@ -831,6 +831,59 @@ export class Daemon {
         conn.write(frame({ id: msg.id, ok: true }))
         return
       }
+      // No live thread (or only a closed one) and no pendingRoot. Until now
+      // we dropped silently, which manifests as "Claude finishes a turn in a
+      // terminal session and Feishu shows nothing." Real causes seen in the
+      // field: shim died on UUID-probe FATAL (Claude Code does NOT respawn
+      // MCP children, so hooks keep firing into a session with no live shim);
+      // the session predates the daemon's current lifetime and threads.json
+      // had no entry; or Stop fired before user_prompt could create the
+      // pendingRoot in a fast-turn race. The hook payload itself carries
+      // enough — uuid + cwd + assistant text — to bootstrap an announce
+      // and seed a thread. Skip the bootstrap when this session_id has a
+      // CLOSED thread (the close is the user's explicit "stop mirroring
+      // here" intent) or when cwd is in the ignore list.
+      if (!thread && uuid && msg.cwd && !this.isIgnoredCwd(msg.cwd)) {
+        const hub = loadAccess(this.accessFile).hubChatId
+        if (hub) {
+          // Title preference: a buffered user_prompt for this cwd if one
+          // arrived but had no live shim to consume it (the canonical
+          // dead-shim symptom in the daemon log), otherwise the first line
+          // of the hook text. Drain the buffered prompt either way so the
+          // next bootstrap doesn't reuse a stale title.
+          const buffered = this.pendingUserPrompts.get(msg.cwd)
+          let title: string
+          if (buffered && Date.now() - buffered.ts < PENDING_PROMPT_TTL_MS) {
+            title = this.titleFromPrompt(buffered.prompt)
+            this.pendingUserPrompts.delete(msg.cwd)
+          } else {
+            title = this.titleFromPrompt(msg.text)
+          }
+          const announceText = [
+            `🟢 ${title}`,
+            `> cwd: \`${msg.cwd}\``,
+            `> session: \`${uuid}\``,
+          ].join("\n")
+          const root = await this.cfg.feishuApi.sendRoot({
+            chat_id: hub, text: announceText, format: "markdown",
+          })
+          const seeded = await this.cfg.feishuApi.sendInThread({
+            root_message_id: root.message_id, text: msg.text,
+            format: "markdown", seed_thread: true,
+          })
+          if (seeded.thread_id) {
+            upsertThread(this.threads, seeded.thread_id, {
+              session_id: uuid, chat_id: hub, root_message_id: root.message_id,
+              cwd: msg.cwd, origin: "terminal", status: "active",
+              last_active_at: Date.now(), last_message_at: Date.now(),
+            })
+            saveThreads(this.threadsFile, this.threads)
+          }
+          process.stderr.write(`daemon: hook_post bootstrap announce session=${uuid} hub=${hub} msg=${root.message_id} thread=${seeded.thread_id ?? "<none>"}\n`)
+          conn.write(frame({ id: msg.id, ok: true, thread_id: seeded.thread_id ?? null }))
+          return
+        }
+      }
       process.stderr.write(`daemon: hook_post NO ROUTE uuid=${uuid} cwd=${msg.cwd} — dropping\n`)
       conn.write(frame({ id: msg.id, ok: false, error: "no thread or pendingRoot match" }))
     } catch (err) {
