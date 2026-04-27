@@ -44,3 +44,30 @@ test("emits a single section when only SOUL.md is present", () => {
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+test("emits all four sections in fixed order: SOUL, USER, FEISHU, AGENTS", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    writeFileSync(join(ws, "SOUL.md"), "soul body")
+    writeFileSync(join(ws, "USER.md"), "user body")
+    writeFileSync(join(ws, "FEISHU.md"), "feishu body")
+    writeFileSync(join(ws, "AGENTS.md"), "agents body")
+    const out = loadBootstrap(stateDir)
+    const soul = out.indexOf("## SOUL")
+    const user = out.indexOf("## USER")
+    const feishu = out.indexOf("## FEISHU")
+    const agents = out.indexOf("## AGENTS")
+    expect(soul).toBeGreaterThan(-1)
+    expect(soul).toBeLessThan(user)
+    expect(user).toBeLessThan(feishu)
+    expect(feishu).toBeLessThan(agents)
+    expect(out).toContain("## SOUL\nsoul body")
+    expect(out).toContain("## USER\nuser body")
+    expect(out).toContain("## FEISHU\nfeishu body")
+    expect(out).toContain("## AGENTS\nagents body")
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
