@@ -91,3 +91,18 @@ test("preserves fixed order when only USER.md and AGENTS.md are present", () => 
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+test("skips whitespace-only file as if absent", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    writeFileSync(join(ws, "SOUL.md"), "   \n\n\t  \n")
+    writeFileSync(join(ws, "USER.md"), "real user content")
+    const out = loadBootstrap(stateDir)
+    expect(out).not.toContain("## SOUL")
+    expect(out).toContain("## USER\nreal user content")
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
