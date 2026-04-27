@@ -287,6 +287,28 @@ Manage access with `/feishu:access`:
 | `FEISHU_STATE_DIR` | Override state directory (default: `~/.claude/channels/feishu`) |
 | `FEISHU_ACCESS_MODE` | Set to `static` for read-only access config |
 
+### Bootstrap files
+
+The daemon prepends a small set of markdown files to the initial prompt
+of every freshly-spawned Feishu session (Y-b spawns). Drop any of the
+following into `~/.claude/channels/feishu/workspace/`; missing files
+are silently skipped:
+
+| File | Purpose |
+|---|---|
+| `SOUL.md` | Personality, tone, guardrails for Claude's replies |
+| `USER.md` | Who the operator is — preferences, working style, role |
+| `FEISHU.md` | Channel-specific behaviour: reply formatting, attachment handling, reaction etiquette |
+| `AGENTS.md` | Optional: multi-agent / skill coordination notes |
+
+Files are read in the fixed order above. Resume (L2) and terminal-launched
+sessions do not load bootstrap — they continue with the resumed jsonl or
+the user's normal `CLAUDE.md` discovery.
+
+Per-file cap: 32 KB. Aggregate cap: 64 KB; over-cap files are truncated and
+trailing sections are dropped with a stderr warning. Read failures other
+than `ENOENT` are logged to the daemon journal and do not block the spawn.
+
 ## Requirements
 
 - [Bun](https://bun.sh/) runtime — used by `.mcp.json` to launch `server.ts`
