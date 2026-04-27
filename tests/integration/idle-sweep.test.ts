@@ -26,12 +26,14 @@ test("idle sweep: feishu stale killed, fresh feishu untouched, terminal untouche
       },
       messageReaction: {
         create: async (args: any) => {
+          const idx = notifyCalls.length + 1
           notifyCalls.push({
             message_id: args.path?.message_id ?? "",
             emoji_type: args.data?.reaction_type?.emoji_type ?? "",
           })
-          return {}
+          return { data: { reaction_id: `rxn_${idx}` } }
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -147,6 +149,11 @@ test("idle sweep: feishu stale killed, fresh feishu untouched, terminal untouche
   expect(back.threads["t_feishu_fresh"]!.status).toBe("active")     // re-flipped, not selected (fresh)
   expect(back.threads["t_terminal_stale"]!.status).toBe("active")   // re-flipped, not selected (terminal)
   expect(back.threads["t_already_inactive"]!.status).toBe("inactive") // skipped, untouched
+
+  // Reaction id was persisted on each killed row so resumeSession can later
+  // remove the exact SLEEP reaction it stamped.
+  expect(back.threads["t_feishu_stale_modern"]!.hibernate_reaction_id).toMatch(/^rxn_\d+$/)
+  expect(back.threads["t_feishu_stale_legacy"]!.hibernate_reaction_id).toMatch(/^rxn_\d+$/)
 
   await daemon.stop()
 })

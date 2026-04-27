@@ -120,6 +120,7 @@ function fakes() {
   const api: Partial<FeishuApi> = {
     reactTo: async (message_id: string, emoji_type: string) => {
       notifyCalls.push({ root_message_id: message_id, emoji_type })
+      return `rxn_${notifyCalls.length}`
     },
   }
   const killTmuxWindow = async (session: string, windowName: string) => {
@@ -168,8 +169,10 @@ test("runIdleSweep: happy path — notify, state.remove, kill, flip-to-inactive,
   expect(f.killCalls).toEqual([{ session: "claude-feishu", windowName: "fb:foo-abc123" }])
   expect(f.daemonState.get("S_stale")).toBeUndefined()
   expect(threads.threads["t_stale"].status).toBe("inactive")
+  expect(threads.threads["t_stale"].hibernate_reaction_id).toBe("rxn_1")
   expect(f.saved.length).toBe(1)
   expect(f.saved[0].threads.t_stale.status).toBe("inactive")
+  expect(f.saved[0].threads.t_stale.hibernate_reaction_id).toBe("rxn_1")
 })
 
 test("runIdleSweep: legacy record without tmux_window_name falls back to fb:<session_id[:8]>", async () => {

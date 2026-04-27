@@ -62,7 +62,14 @@ export async function runIdleSweep(deps: IdleSweepDeps): Promise<{ killed: strin
 
     if (deps.feishuApi) {
       try {
-        await deps.feishuApi.reactTo(t.root_message_id, HIBERNATE_REACTION)
+        const reaction_id = await deps.feishuApi.reactTo(t.root_message_id, HIBERNATE_REACTION)
+        // Stash the reaction_id on the thread record so resumeSession can
+        // delete this exact reaction on revival. Some live-API mocks return
+        // undefined; treat that as best-effort and just skip persistence.
+        if (reaction_id) {
+          const rec = deps.threads.threads[t.thread_id]
+          if (rec) rec.hibernate_reaction_id = reaction_id
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         deps.log(`idle-sweep: notify failed for thread=${t.thread_id}: ${msg}`)

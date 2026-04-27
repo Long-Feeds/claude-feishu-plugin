@@ -20,6 +20,11 @@ export type ThreadRecord = {
   // this field fall back to `fb:<session_id[:8]>` in the sweeper.
   tmux_window_name?: string
   spawn_env?: Record<string, string>
+  // Server-assigned id of the SLEEP emoji the idle sweeper stamped on
+  // root_message_id at hibernate time. Persisted so resumeSession can
+  // remove that exact reaction even after a daemon restart. Cleared on
+  // successful (or attempted) removal at resume.
+  hibernate_reaction_id?: string
 }
 
 export type PendingRoot = {

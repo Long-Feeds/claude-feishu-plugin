@@ -22,6 +22,10 @@ function mockClient(): { client: LarkLike; calls: any[] } {
       messageReaction: {
         create: async (args) => {
           calls.push({ op: "react", args })
+          return { data: { reaction_id: "rxn_mock" } }
+        },
+        delete: async (args) => {
+          calls.push({ op: "unreact", args })
           return {}
         },
       },
@@ -59,12 +63,22 @@ test("sendInThread uses im.message.reply with reply_in_thread=true on root", asy
   expect(calls[0]!.args.data.reply_in_thread).toBe(true)
 })
 
-test("reactTo calls messageReaction.create", async () => {
+test("reactTo calls messageReaction.create and returns reaction_id", async () => {
   const { client, calls } = mockClient()
   const api = new FeishuApi(client)
-  await api.reactTo("m1", "THUMBSUP")
+  const id = await api.reactTo("m1", "THUMBSUP")
   expect(calls[0]!.op).toBe("react")
   expect(calls[0]!.args.data.reaction_type.emoji_type).toBe("THUMBSUP")
+  expect(id).toBe("rxn_mock")
+})
+
+test("removeReaction calls messageReaction.delete with message_id and reaction_id", async () => {
+  const { client, calls } = mockClient()
+  const api = new FeishuApi(client)
+  await api.removeReaction("m1", "rxn_abc")
+  expect(calls[0]!.op).toBe("unreact")
+  expect(calls[0]!.args.path.message_id).toBe("m1")
+  expect(calls[0]!.args.path.reaction_id).toBe("rxn_abc")
 })
 
 test("preprocessMarkdownForFeishu leaves text without tables unchanged", () => {

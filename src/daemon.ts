@@ -1325,6 +1325,20 @@ export class Daemon {
 
   private async resumeSession(rec: ThreadRecord, thread_id: string, event: FeishuEvent): Promise<void> {
     const tmux = this.cfg.tmuxSession ?? "claude-feishu"
+    // Pull the SLEEP emoji the sweeper stamped on the thread root, so the
+    // visual state matches the now-active session. Best-effort — a stale
+    // hibernate_reaction_id (e.g. user manually removed the emoji, or the
+    // root message was deleted) must not block resume.
+    const stored = this.threads.threads[thread_id]
+    const reactionId = stored?.hibernate_reaction_id
+    if (reactionId && this.cfg.feishuApi) {
+      try {
+        await this.cfg.feishuApi.removeReaction(rec.root_message_id, reactionId)
+      } catch (err) {
+        process.stderr.write(`daemon: clear hibernate reaction failed for thread=${thread_id}: ${err}\n`)
+      }
+      if (stored) delete stored.hibernate_reaction_id
+    }
     const { existsSync } = await import("fs")
     if (!existsSync(rec.cwd)) {
       if (this.cfg.feishuApi) {
