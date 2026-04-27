@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs"
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import { loadBootstrap } from "../src/bootstrap"
@@ -102,6 +102,37 @@ test("skips whitespace-only file as if absent", () => {
     const out = loadBootstrap(stateDir)
     expect(out).not.toContain("## SOUL")
     expect(out).toContain("## USER\nreal user content")
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test("logs and skips a file that cannot be read (EACCES), keeps loading the rest", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    const soulPath = join(ws, "SOUL.md")
+    writeFileSync(soulPath, "soul")
+    chmodSync(soulPath, 0o000) // make unreadable
+    writeFileSync(join(ws, "USER.md"), "user")
+
+    const orig = process.stderr.write.bind(process.stderr)
+    const logs: string[] = []
+    ;(process.stderr as any).write = (chunk: any) => {
+      logs.push(typeof chunk === "string" ? chunk : chunk.toString())
+      return true
+    }
+    let out = ""
+    try {
+      out = loadBootstrap(stateDir)
+    } finally {
+      ;(process.stderr as any).write = orig
+      chmodSync(soulPath, 0o600)
+    }
+    expect(out).toContain("## USER\nuser")
+    expect(out).not.toContain("## SOUL")
+    expect(logs.join("")).toMatch(/bootstrap: failed to read SOUL\.md/)
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }
