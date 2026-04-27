@@ -16,18 +16,25 @@ test("idle sweep: feishu stale killed, fresh feishu untouched, terminal untouche
   const dir = mkdtempSync(join(tmpdir(), "idle-integ-"))
   const sock = join(dir, "daemon.sock")
 
-  const notifyCalls: string[] = []
+  const notifyCalls: { message_id: string; emoji_type: string }[] = []
   const api = new FeishuApi({
     im: {
       message: {
         create: async () => ({ data: {} }),
-        reply: async (args: any) => {
-          notifyCalls.push(args.path?.message_id ?? "")
-          return { data: { message_id: "m_notif" } }
-        },
+        reply: async () => ({ data: { message_id: "m_notif" } }),
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: {
+        create: async (args: any) => {
+          const idx = notifyCalls.length + 1
+          notifyCalls.push({
+            message_id: args.path?.message_id ?? "",
+            emoji_type: args.data?.reaction_type?.emoji_type ?? "",
+          })
+          return { data: { reaction_id: `rxn_${idx}` } }
+        },
+        delete: async () => ({}),
+      },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -118,10 +125,13 @@ test("idle sweep: feishu stale killed, fresh feishu untouched, terminal untouche
     ["t_feishu_stale_legacy", "t_feishu_stale_modern"].sort(),
   )
 
-  // Two notifications sent (to each stale feishu root). t_already_inactive
+  // Two reactions stamped (one on each stale feishu root). t_already_inactive
   // does NOT appear here — proving the skip-inactive filter prevents repeat
   // hibernate spam.
-  expect(notifyCalls.sort()).toEqual(["m_root_legacy", "m_root_modern"].sort())
+  expect(notifyCalls.map((c) => c.message_id).sort()).toEqual(
+    ["m_root_legacy", "m_root_modern"].sort(),
+  )
+  for (const c of notifyCalls) expect(c.emoji_type).toBe("SLEEP")
 
   // Two kill-window invocations with correct target strings.
   const kills = spawnedCmds
@@ -139,6 +149,11 @@ test("idle sweep: feishu stale killed, fresh feishu untouched, terminal untouche
   expect(back.threads["t_feishu_fresh"]!.status).toBe("active")     // re-flipped, not selected (fresh)
   expect(back.threads["t_terminal_stale"]!.status).toBe("active")   // re-flipped, not selected (terminal)
   expect(back.threads["t_already_inactive"]!.status).toBe("inactive") // skipped, untouched
+
+  // Reaction id was persisted on each killed row so resumeSession can later
+  // remove the exact SLEEP reaction it stamped.
+  expect(back.threads["t_feishu_stale_modern"]!.hibernate_reaction_id).toMatch(/^rxn_\d+$/)
+  expect(back.threads["t_feishu_stale_legacy"]!.hibernate_reaction_id).toMatch(/^rxn_\d+$/)
 
   await daemon.stop()
 })

@@ -84,7 +84,7 @@ test("terminal register auto-announces; first reply seeds thread on announce roo
         reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_reply", thread_id: "t1" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -133,7 +133,7 @@ test("top-level DM triggers feishu-spawn via injected spawn_cmd", async () => {
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -167,7 +167,7 @@ test("first delivered inbound auto-populates hubChatId when unset", async () => 
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -206,7 +206,7 @@ test("terminal user_prompt announces to hub using the prompt as title and primes
         reply: async () => ({ data: { message_id: "m2", thread_id: "t1" } }),
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -259,7 +259,7 @@ test("terminal register pushes a bridge hint inbound so Claude knows to post upd
         create: async () => ({ data: { message_id: "om_announce" } }),
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -304,7 +304,7 @@ test("terminal register with same UUID as an existing (inactive) thread flips it
         create: async (a) => { created.push(a); return { data: { message_id: "om_new_announce" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -363,7 +363,7 @@ test("user_prompt arriving BEFORE register (claude --print race) is buffered and
         create: async (a) => { created.push(a); return { data: { message_id: "om_raced" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -415,7 +415,7 @@ test("multiple user_prompts before shim registers — first wins as announce tit
         create: async (a) => { created.push(a); return { data: { message_id: "om_first" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -474,7 +474,7 @@ test("user_prompt with channel-wrapped or bridge-hint text is suppressed and doe
         create: async (a) => { created.push(a); return { data: { message_id: "om_leak" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -532,7 +532,7 @@ test("terminal register with ignored cwd prefix does NOT announce, even after fi
         create: async (a) => { created.push(a); return { data: { message_id: "om_should_not_exist" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -584,7 +584,7 @@ test("terminal register with session_id whose announce is in pendingRoots (persi
         create: async (a) => { created.push(a); return { data: { message_id: "om_new" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -633,7 +633,7 @@ test("terminal register with known session_id (thread record exists) does NOT re
         create: async (a) => { created.push(a); return { data: { message_id: "om_x" } } },
         reply: async () => ({ data: {} }), patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -682,7 +682,7 @@ test("hook_post routes by claude_session_uuid into that session's existing threa
         reply: async (a) => { replies.push(a); return { data: { message_id: "m_hook" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -739,7 +739,7 @@ test("hook_post with no thread but a pending announce root seeds the thread", as
         reply: async (a) => { replies.push(a); return { data: { message_id: "m_seed", thread_id: "t_seeded" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -801,7 +801,7 @@ test("hook_post with no thread AND no pendingRoot bootstraps an announce + threa
         reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_orphan_seed", thread_id: "t_orphan" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -875,7 +875,7 @@ test("hook_post bootstrap uses a buffered user_prompt as the announce title when
         reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "m_seed", thread_id: "t_titled" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -930,7 +930,7 @@ test("hook_post bootstrap is suppressed for closed threads (respects explicit cl
         reply: async (a) => { calls.push({ op: "reply", a }); return { data: { message_id: "must_not_be_called" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -987,6 +987,7 @@ test("delivered inbound message gets a 'received' emoji reaction on the trigger"
           })
           return {}
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -1030,6 +1031,7 @@ test("dropped message (disallowed sender) gets no reaction", async () => {
           })
           return {}
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -1070,6 +1072,7 @@ test("reply into closed thread gets a distinct 'closed' reaction", async () => {
           })
           return {}
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -1111,10 +1114,20 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   const dir = mkdtempSync(join(tmpdir(), "daemon-test-"))
   const sock = join(dir, "daemon.sock")
   const spawned: { argv: string[]; env: Record<string, string> }[] = []
+  const reactionDeletes: { message_id: string; reaction_id: string }[] = []
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: {
+        create: async () => ({}),
+        delete: async (a: any) => {
+          reactionDeletes.push({
+            message_id: a.path.message_id,
+            reaction_id: a.path.reaction_id,
+          })
+          return {}
+        },
+      },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1122,7 +1135,8 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   const acc = defaultAccess(); acc.allowFrom = ["ou_abc"]; acc.hubChatId = "oc_hub"
   saveAccess(join(dir, "access.json"), acc)
 
-  // Seed threads.json with an inactive thread.
+  // Seed threads.json with an inactive thread that the sweeper marked with
+  // a hibernate reaction; resume must remove that exact reaction.
   const threadsFile = join(dir, "threads.json")
   const { loadThreads, saveThreads: st } = await import("../src/threads")
   const store = loadThreads(threadsFile)
@@ -1131,6 +1145,7 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
     chat_id: "oc_dm", root_message_id: "m0", cwd: "/tmp",    // use /tmp so it exists
     origin: "feishu", status: "inactive",
     last_active_at: 0, last_message_at: 0,
+    hibernate_reaction_id: "rxn_sleep_for_t1",
   }
   st(threadsFile, store)
 
@@ -1158,6 +1173,13 @@ test("reply in inactive thread triggers resume spawn with FEISHU_RESUME_UUID", a
   expect(pending).toBeDefined()
   expect(pending.content).toBe("continue")
   expect(pending.meta.thread_id).toBe("t1")
+  // Resume cleared the SLEEP reaction the sweeper had stamped: exactly one
+  // delete call against (root_message_id, reaction_id), and the field is gone
+  // from the persisted record so a daemon restart doesn't try to delete it
+  // a second time (the API rejects unknown reaction_ids).
+  expect(reactionDeletes).toEqual([{ message_id: "m0", reaction_id: "rxn_sleep_for_t1" }])
+  const persisted = loadThreads(threadsFile).threads["t1"]!
+  expect(persisted.hibernate_reaction_id).toBeUndefined()
   await daemon.stop()
 })
 
@@ -1177,7 +1199,7 @@ test("Stop hook mirror is skipped when reply was called the same turn", async ()
         reply: async (a) => { replyCalls.push(a); return { data: { message_id: "m_x", thread_id: "t_dup" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1241,7 +1263,7 @@ test("Stop hook mirror still fires on a NEW turn (counter resets on UserPromptSu
         reply: async (a) => { replyCalls.push(a); return { data: { message_id: "m_x", thread_id: "t_seq" } } },
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1308,6 +1330,7 @@ test("feishu inbound to active session WITHOUT tmux_window_name reacts CrossMark
           reactions.push({ message_id: a.path.message_id, emoji_type: a.data.reaction_type.emoji_type })
           return {}
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -1374,6 +1397,7 @@ test("feishu inbound uses tmux_window_name reported by shim, not derived from se
           reactions.push({ message_id: a.path.message_id, emoji_type: a.data.reaction_type.emoji_type })
           return {}
         },
+        delete: async () => ({}),
       },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
@@ -1458,7 +1482,7 @@ test("pendingFeishuSpawns is NOT hijacked by a stale shim registering in the sam
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1596,7 +1620,7 @@ test("feishu-spawn register records tmux_window_name in the thread binding", asy
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1657,7 +1681,7 @@ test("runIdleSweepOnce kills a stale feishu thread, leaves terminal thread alone
         reply: async () => ({ data: { message_id: "m_notif" } }),
         patch: async () => ({}),
       },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },
@@ -1732,7 +1756,7 @@ test("inbound feishu message into a known thread bumps last_message_at", async (
   const api = new FeishuApi({
     im: {
       message: { create: async () => ({ data: {} }), reply: async () => ({ data: {} }), patch: async () => ({}) },
-      messageReaction: { create: async () => ({}) },
+      messageReaction: { create: async () => ({}), delete: async () => ({}) },
       messageResource: { get: async () => ({ writeFile: async () => {} }) },
       image: { create: async () => ({}) }, file: { create: async () => ({}) },
     },

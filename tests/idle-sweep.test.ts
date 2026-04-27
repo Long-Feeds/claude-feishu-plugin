@@ -110,7 +110,7 @@ import { DaemonState } from "../src/daemon-state"
 import type { FeishuApi } from "../src/feishu-api"
 import type { Socket } from "net"
 
-type NotifyCall = { root_message_id: string; text: string; seed_thread: boolean }
+type NotifyCall = { root_message_id: string; emoji_type: string }
 type KillCall = { session: string; windowName: string }
 
 function fakes() {
@@ -118,13 +118,9 @@ function fakes() {
   const killCalls: KillCall[] = []
   const logs: string[] = []
   const api: Partial<FeishuApi> = {
-    sendInThread: async (args: any) => {
-      notifyCalls.push({
-        root_message_id: args.root_message_id,
-        text: args.text,
-        seed_thread: args.seed_thread,
-      })
-      return { message_id: "mock_msg" }
+    reactTo: async (message_id: string, emoji_type: string) => {
+      notifyCalls.push({ root_message_id: message_id, emoji_type })
+      return `rxn_${notifyCalls.length}`
     },
   }
   const killTmuxWindow = async (session: string, windowName: string) => {
@@ -169,13 +165,14 @@ test("runIdleSweep: happy path — notify, state.remove, kill, flip-to-inactive,
   expect(result.killed).toEqual(["t_stale"])
   expect(f.notifyCalls.length).toBe(1)
   expect(f.notifyCalls[0]!.root_message_id).toBe("m_root")
-  expect(f.notifyCalls[0]!.text).toContain("休眠")
-  expect(f.notifyCalls[0]!.seed_thread).toBe(false)
+  expect(f.notifyCalls[0]!.emoji_type).toBe("SLEEP")
   expect(f.killCalls).toEqual([{ session: "claude-feishu", windowName: "fb:foo-abc123" }])
   expect(f.daemonState.get("S_stale")).toBeUndefined()
   expect(threads.threads["t_stale"].status).toBe("inactive")
+  expect(threads.threads["t_stale"].hibernate_reaction_id).toBe("rxn_1")
   expect(f.saved.length).toBe(1)
   expect(f.saved[0].threads.t_stale.status).toBe("inactive")
+  expect(f.saved[0].threads.t_stale.hibernate_reaction_id).toBe("rxn_1")
 })
 
 test("runIdleSweep: legacy record without tmux_window_name falls back to fb:<session_id[:8]>", async () => {
@@ -205,7 +202,7 @@ test("runIdleSweep: notification failure does NOT block kill", async () => {
   const now = 1_800_000_000_000
   const f = fakes()
   const api: Partial<FeishuApi> = {
-    sendInThread: async () => { throw new Error("feishu api down") },
+    reactTo: async () => { throw new Error("feishu api down") },
   }
   const threads: any = {
     version: 1,

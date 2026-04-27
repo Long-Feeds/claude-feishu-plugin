@@ -10,7 +10,10 @@ export type LarkLike = {
       reply: (args: any) => Promise<any>
       patch: (args: any) => Promise<any>
     }
-    messageReaction: { create: (args: any) => Promise<any> }
+    messageReaction: {
+      create: (args: any) => Promise<any>
+      delete: (args: any) => Promise<any>
+    }
     messageResource: { get: (args: any) => Promise<any> }
     image: { create: (args: any) => Promise<any> }
     file: { create: (args: any) => Promise<any> }
@@ -254,10 +257,20 @@ export class FeishuApi {
     })
   }
 
-  async reactTo(message_id: string, emoji_type: string): Promise<void> {
-    await this.client.im.messageReaction.create({
+  // Returns the server-assigned reaction_id (needed later to delete this
+  // specific reaction). Older mocks may not surface it; callers must treat
+  // an undefined return as "reaction stamped, but we can't remove it later".
+  async reactTo(message_id: string, emoji_type: string): Promise<string | undefined> {
+    const resp = await this.client.im.messageReaction.create({
       path: { message_id },
       data: { reaction_type: { emoji_type } },
+    })
+    return resp?.data?.reaction_id ?? undefined
+  }
+
+  async removeReaction(message_id: string, reaction_id: string): Promise<void> {
+    await this.client.im.messageReaction.delete({
+      path: { message_id, reaction_id },
     })
   }
 
