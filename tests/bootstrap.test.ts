@@ -71,3 +71,23 @@ test("emits all four sections in fixed order: SOUL, USER, FEISHU, AGENTS", () =>
     rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+test("preserves fixed order when only USER.md and AGENTS.md are present", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    writeFileSync(join(ws, "USER.md"), "user")
+    writeFileSync(join(ws, "AGENTS.md"), "agents")
+    const out = loadBootstrap(stateDir)
+    const user = out.indexOf("## USER")
+    const agents = out.indexOf("## AGENTS")
+    expect(user).toBeGreaterThan(-1)
+    expect(agents).toBeGreaterThan(-1)
+    expect(user).toBeLessThan(agents)
+    expect(out).not.toContain("## SOUL")
+    expect(out).not.toContain("## FEISHU")
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
