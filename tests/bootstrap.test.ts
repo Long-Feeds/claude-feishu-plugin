@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { mkdtempSync, rmSync } from "fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import { loadBootstrap } from "../src/bootstrap"
@@ -20,9 +20,26 @@ test("returns empty string when workspace dir is missing", () => {
 test("returns empty string when workspace dir exists but is empty", () => {
   const stateDir = tempStateDir()
   try {
-    const fs = require("fs") as typeof import("fs")
-    fs.mkdirSync(join(stateDir, "workspace"))
+    mkdirSync(join(stateDir, "workspace"))
     expect(loadBootstrap(stateDir)).toBe("")
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true })
+  }
+})
+
+test("emits a single section when only SOUL.md is present", () => {
+  const stateDir = tempStateDir()
+  try {
+    const ws = join(stateDir, "workspace")
+    mkdirSync(ws)
+    writeFileSync(join(ws, "SOUL.md"), "you are a lobster")
+    const out = loadBootstrap(stateDir)
+    expect(out.startsWith("# Feishu Channel Bootstrap\n\n")).toBe(true)
+    expect(out).toContain("## SOUL\nyou are a lobster")
+    expect(out).not.toContain("## USER")
+    expect(out).not.toContain("## FEISHU")
+    expect(out).not.toContain("## AGENTS")
+    expect(out.endsWith("---\n\n# User Message\n\n")).toBe(true)
   } finally {
     rmSync(stateDir, { recursive: true, force: true })
   }
